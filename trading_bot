@@ -1,0 +1,1871 @@
+import numpy as np
+import threading
+import time
+import pandas as pd
+from tensorflow.keras.models import load_model
+from sklearn.preprocessing import MinMaxScaler, RobustScaler, LabelEncoder
+import json
+import requests
+import datetime
+from datetime import timedelta
+import sys
+from flask import Flask, request, jsonify
+import socketio
+import talib
+import hmac
+import hashlib
+from pyts.image import GramianAngularField
+from tensorflow.nn import softmax
+import tensorflow as tf
+import os
+import warnings
+from flask_cors import CORS, cross_origin
+import logging
+import uuid
+import joblib
+import pickle
+from statsmodels.tsa.statespace.sarimax import SARIMAXResults
+
+warnings.filterwarnings("ignore")
+app = Flask(__name__)
+cors = CORS(app)
+app.config['CORS_HEADERS'] = 'Content-Type'
+
+# Configuration
+LOOKBACK = 60
+WINDOW_SIZE = 60
+TARGET_LOOKAHEAD = 1
+INITIAL_DATA_POINTS = 1000
+max_positions = 1  # ONLY 1 POSITION AT A TIME
+min_price_distance = 0.0005
+min_time_between_trades = timedelta(seconds=1)
+
+# TRADING MODE TOGGLE
+REAL_TRADING_MODE = False
+
+# EMA reconstruction constants
+EMA_PERIOD = 2
+ALPHA = 2 / (EMA_PERIOD + 1)
+
+MAKER_FEE = 0.0002
+TAKER_FEE = 0.0005
+
+# ============================================================
+# CAPITAL UTILIZATION FIX
+# ============================================================
+POSITION_SIZE_PCT = 0.95   # Use 95% of balance per trade (was 2)
+MIN_POSITION_SIZE = 1      # No artificial floor (was 100)
+LEVERAGE = 5               # Same as before
+# ============================================================
+
+# LOOSENED confidence thresholds for more trading activity
+LSTM_CONFIDENCE_THRESHOLD = 0.10
+CNN_CONFIDENCE_THRESHOLD = 0.10
+SARIMAX_CONFIDENCE_THRESHOLD = 0.10
+COMBINED_CONFIDENCE_THRESHOLD = 0.10
+
+# Research-based main candlestick patterns
+MAIN_CANDLE_PATTERNS = [
+    'CDLENGULFING',
+    'CDLHARAMI',
+    'CDLHAMMER',
+    'CDLSHOOTINGSTAR',
+    'CDLDOJI',
+    'CDLMORNINGSTAR'
+]
+
+CANDLE_PATTERNS = MAIN_CANDLE_PATTERNS + [
+    'CDLINVERTEDHAMMER', 'CDLEVENINGSTAR', 'CDLHANGINGMAN', 'CDLBELTHOLD', 'CDLPIERCING',
+    'CDL3WHITESOLDIERS', 'CDL3BLACKCROWS', 'CDLMARUBOZU', 'CDLSPINNINGTOP',
+    'CDLDRAGONFLYDOJI', 'CDLGRAVESTONEDOJI', 'CDLTAKURI', 'CDL3INSIDE', 'CDL3OUTSIDE'
+]
+
+# Global state
+active_positions = []
+position_lock = threading.Lock()
+trade_log_global = []
+recent_trades = []
+
+total_fees = 0.0
+total_pnl = 0.0
+current_pengu_price = None
+cnn_model = None
+lstm_model = None
+lstm_mae = 0.0001
+models_loaded = False
+lstm_scaler = RobustScaler()
+cnn_scaler = MinMaxScaler(feature_range=(0, 1))
+target_scaler = RobustScaler()
+pattern_label_encoder = None
+pattern_mapping = None
+full_data = []
+current_status = ""
+last_price = None
+last_status_length = 0
+needed = 0
+order_status = "filled"
+last_trade_time = None
+trade_cooldown = timedelta(seconds=1)
+
+# SARIMAX integration globals
+sarimax_model = None
+sarimax_scaler_x = None
+sarimax_scaler_y = None
+sarimax_metadata = None
+sarimax_mae = 0.0001
+
+# Research-based CULR scaler
+culr_scaler = None
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("trading_bot.log"),
+        logging.StreamHandler()
+    ]
+)
+
+closed_positions_list = []
+
+latest_signal_data = {
+    'signal': 0,
+    'confidence': 0.0,
+    'reason': 'No signal',
+    'lstm_signal': 0,
+    'lstm_confidence': 0.0,
+    'cnn_signal': 0,
+    'cnn_confidence': 0.0,
+    'pattern': 'NO_PATTERN',
+    'sarimax_signal': 0,
+    'sarimax_confidence': 0.0,
+    'consensus_achieved': False,
+    'rsi': 0.0,
+    'bb_position': 0.0,
+    'volume_ratio': 0.0,
+    'macd_hist': 0.0
+}
+
+def order_and_balance_update():
+    global order_status, active_positions
+
+    if not REAL_TRADING_MODE:
+        return
+
+    socketEndpoint = 'wss://stream.coindcx.com'
+
+    key = "25cfd2c369224d983d263096beb1748faf683f54d1468435"
+    secret = "a0501522facc1a37495020de16053ddcbb5906c88204fdda8eb0b140e09529ab"
+
+    secret_bytes = bytes(secret, encoding='utf-8')
+    channelName = "coindcx"
+    body = {"channel": channelName}
+    json_body = json.dumps(body, separators=(',', ':'))
+    signature = hmac.new(secret_bytes, json_body.encode(), hashlib.sha256).hexdigest()
+
+    sio2 = socketio.Client()
+
+    @sio2.event
+    def connect():
+        logging.info("Connected to order channel!")
+        sio2.emit('join', {'channelName': channelName, 'authSignature': signature, 'apiKey': key})
+
+    @sio2.on('order-update')
+    def on_message1(response):
+        global order_status, active_positions
+        try:
+            if isinstance(response, dict) and 'data' in response:
+                order_data = json.loads(response['data'])
+            else:
+                order_data = response
+
+            if isinstance(order_data, list) and len(order_data) > 0:
+                status = order_data[0].get('status', 'Unknown')
+                order_id = order_data[0].get('order_id')
+                logging.info(f"Order status update: {status} for order {order_id}")
+
+                order_status = status
+
+                if status == "filled":
+                    with position_lock:
+                        for position in active_positions:
+                            if position.order_id == order_id:
+                                position.order_filled = True
+                                logging.info(f"Order {order_id} filled for position {position.id}")
+                                break
+
+        except Exception as e:
+            logging.error(f"Error processing order update: {e}")
+
+    sio2.connect(socketEndpoint, transports=['websocket'])
+    sio2.wait()
+
+def fetch_balance():
+    if not REAL_TRADING_MODE:
+        return current_balance
+
+    key = "25cfd2c369224d983d263096beb1748faf683f54d1468435"
+    secret = "a0501522facc1a37495020de16053ddcbb5906c88204fdda8eb0b140e09529ab"
+
+    secret_bytes = bytes(secret, encoding='utf-8')
+    timeStamp = int(round(time.time() * 1000))
+    body = {"timestamp": timeStamp}
+    json_body = json.dumps(body, separators=(',', ':'))
+    signature = hmac.new(secret_bytes, json_body.encode(), hashlib.sha256).hexdigest()
+    url = "https://api.coindcx.com/exchange/v1/derivatives/futures/wallets"
+    headers = {
+        'Content-Type': 'application/json',
+        'X-AUTH-APIKEY': key,
+        'X-AUTH-SIGNATURE': signature
+    }
+    response = requests.get(url, data=json_body, headers=headers)
+    data = response.json()
+    usdt_balance = next((item['balance'] for item in data if item['currency_short_name'] == 'USDT'), 0.0)
+    return float(usdt_balance)
+
+initial_balance = 10000
+current_balance = initial_balance
+
+order_lock = threading.Lock()
+
+def place_order(order_type_buy_sell, price, shares, position_id=None):
+    global order_status
+
+    if not REAL_TRADING_MODE:
+        logging.info(f"PAPER TRADE: {order_type_buy_sell} order simulated - {shares} BIO at {price}")
+        order_status = "filled"
+
+        simulated_order_id = f"paper_{uuid.uuid4().hex[:8]}"
+
+        if position_id:
+            with position_lock:
+                for position in active_positions:
+                    if position.id == position_id:
+                        position.order_id = simulated_order_id
+                        position.order_filled = True
+                        logging.info(f"Linked paper order {simulated_order_id} to position {position_id}")
+                        break
+
+        return {'id': simulated_order_id, 'status': 'filled'}
+
+    with order_lock:
+        key = "25cfd2c369224d983d263096beb1748faf683f54d1468435"
+        secret = "a0501522facc1a37495020de16053ddcbb5906c88204fdda8eb0b140e09529ab"
+
+        secret_bytes = bytes(secret, encoding='utf-8')
+        timeStamp = int(round(time.time() * 1000))
+        body = {
+            "timestamp": timeStamp,
+            "order": {
+                "side": order_type_buy_sell,
+                "pair": "B-HIFI_USDT",
+                "order_type": "market_order",
+                "total_quantity": shares,
+                "leverage": LEVERAGE,
+                "notification": "email_notification",
+                "time_in_force": "good_till_cancel",
+                "hidden": False,
+                "post_only": False
+            }
+        }
+
+        json_body = json.dumps(body, separators=(',', ':'))
+        signature = hmac.new(secret_bytes, json_body.encode(), hashlib.sha256).hexdigest()
+
+        url = "https://api.coindcx.com/exchange/v1/derivatives/futures/orders/create"
+        headers = {
+            'Content-Type': 'application/json',
+            'X-AUTH-APIKEY': key,
+            'X-AUTH-SIGNATURE': signature
+        }
+
+        logging.info(f"Placing {order_type_buy_sell} order: {shares} BIO at {price}")
+
+        response = requests.post(url, data=json_body, headers=headers)
+        if response.status_code == 200:
+            try:
+                order_response = response.json()
+                logging.info(f"Order response: {order_response}")
+
+                order_id = None
+                if isinstance(order_response, dict):
+                    order_id = order_response.get('id')
+                elif isinstance(order_response, list) and len(order_response) > 0:
+                    first_item = order_response[0]
+                    if isinstance(first_item, dict):
+                        order_id = first_item.get('id')
+
+                if position_id and order_id:
+                    with position_lock:
+                        for position in active_positions:
+                            if position.id == position_id:
+                                position.order_id = order_id
+                                logging.info(f"Linked order {order_id} to position {position_id}")
+                                break
+
+                return order_response
+
+            except json.JSONDecodeError as e:
+                logging.error(f"Error parsing JSON: {e}")
+                logging.error(f"Response text: {response.text}")
+        else:
+            logging.error(f"Request failed with status code {response.status_code}")
+            logging.error(f"Response text: {response.text}")
+
+        return None
+
+class TradePosition:
+    def __init__(self, position_type, entry_price, shares, predicted_move, predicted_diff):
+        self.id = str(uuid.uuid4())
+        self.position_type = position_type.lower()
+        self.entry_price = float(entry_price)
+        self.shares = float(shares)
+        self.entry_time = datetime.datetime.now()
+        self.exited = False
+        self.position_value = self.entry_price * self.shares
+        self.entry_fee = self.position_value * TAKER_FEE
+        self.exit_fee = 0.0
+        self.pnl = 0.0
+        self.order_filled = False
+        self.order_id = None
+        self.predicted_diff = predicted_diff
+        self.set_stop_target()
+
+        # FIXED: Deduct the FULL position value + entry fee so balance
+        #       reflects actual capital usage. When the position closes,
+        #       we return the position value + net PnL.
+        global current_balance, total_fees
+        current_balance -= self.position_value
+        current_balance -= self.entry_fee
+        total_fees += self.entry_fee
+
+    def set_stop_target(self):
+        """Target = 1% | Stop Loss = 4%"""
+        target_move = self.entry_price * 0.01      # 1%
+        stop_loss_move = self.entry_price * 0.04   # 4%
+
+        if self.position_type == "long":
+            self.target = round(self.entry_price + target_move, 8)
+            self.stop_loss = round(self.entry_price - stop_loss_move, 8)
+        else:
+            self.target = round(self.entry_price - target_move, 8)
+            self.stop_loss = round(self.entry_price + stop_loss_move, 8)
+
+        target_percentage = abs(self.target - self.entry_price) / self.entry_price * 100
+        stop_loss_percentage = abs(self.stop_loss - self.entry_price) / self.entry_price * 100
+
+        logging.info(f"Position {self.id}: Entry={self.entry_price:.6f}, "
+                    f"Target={self.target:.6f} ({target_percentage:.2f}%), "
+                    f"StopLoss={self.stop_loss:.6f} ({stop_loss_percentage:.2f}%)")
+
+def can_open_new_position():
+    with position_lock:
+        active_count = sum(1 for position in active_positions if not position.exited)
+        return active_count < max_positions and current_balance > 1
+
+def is_valid_new_position(position_type, entry_price):
+    with position_lock:
+        for position in active_positions:
+            if not position.exited and (position.position_type == position_type and
+                abs(entry_price - position.entry_price) < min_price_distance):
+                return False
+        return True
+
+def check_positions(current_price):
+    global active_positions, current_balance, total_fees, total_pnl, order_status, trade_log_global, last_trade_time, closed_positions_list
+
+    current_price = float(current_price)
+    positions_to_remove = []
+
+    with position_lock:
+        active_positions = [p for p in active_positions if not p.exited]
+
+        for position in active_positions:
+            logging.info(f"Checking position {position.id}: type={position.position_type}, "
+                        f"entry={position.entry_price}, current={current_price}, "
+                        f"target={position.target}, stop_loss={position.stop_loss}, "
+                        f"order_filled={position.order_filled}")
+
+            if not position.order_filled:
+                if (datetime.datetime.now() - position.entry_time) > timedelta(seconds=30):
+                    logging.warning(f"Order for position {position.id} taking too long, assuming filled")
+                    position.order_filled = True
+                else:
+                    continue
+
+            exit_reason = None
+            exit_price = current_price
+
+            if position.position_type == "long":
+                if current_price >= position.target:
+                    exit_reason = "target"
+                    exit_price = position.target
+                elif current_price <= position.stop_loss:
+                    exit_reason = "stop loss"
+                    exit_price = position.stop_loss
+            else:
+                if current_price <= position.target:
+                    exit_reason = "target"
+                    exit_price = position.target
+                elif current_price >= position.stop_loss:
+                    exit_reason = "stop loss"
+                    exit_price = position.stop_loss
+
+            if not exit_reason and (datetime.datetime.now() - position.entry_time) > timedelta(minutes=240):
+                exit_reason = "time limit"
+
+            if exit_reason:
+                # PnL on the position
+                if position.position_type == "long":
+                    profit_loss = (exit_price - position.entry_price) * position.shares
+                else:
+                    profit_loss = (position.entry_price - exit_price) * position.shares
+
+                position.exit_fee = exit_price * position.shares * (
+                    TAKER_FEE if exit_reason in ["stop loss", "time limit"] else MAKER_FEE
+                )
+
+                net_pnl = profit_loss - position.entry_fee - position.exit_fee
+                position.pnl = net_pnl
+
+                # FIXED: Return position value + net PnL to balance
+                # (position_value + entry_fee were removed at open)
+                current_balance += position.position_value
+                current_balance += net_pnl
+                total_fees += position.exit_fee
+                total_pnl += net_pnl
+
+                position.exited = True
+                position.exit_time = datetime.datetime.now()
+                position.exit_reason = exit_reason
+                last_trade_time = datetime.datetime.now()
+
+                closed_position_data = {
+                    'id': position.id,
+                    'type': position.position_type,
+                    'entry_price': position.entry_price,
+                    'exit_price': exit_price,
+                    'shares': position.shares,
+                    'entry_time': position.entry_time,
+                    'exit_time': position.exit_time,
+                    'pnl': net_pnl,
+                    'fees': position.entry_fee + position.exit_fee,
+                    'exit_reason': exit_reason
+                }
+                closed_positions_list.append(closed_position_data)
+
+                if REAL_TRADING_MODE:
+                    order_type = "sell" if position.position_type == "long" else "buy"
+                    place_order(order_type, exit_price, position.shares)
+                else:
+                    logging.info(f"PAPER TRADE: Exit {position.position_type} at {exit_price}")
+
+                curr_balance = current_balance
+
+                trade_log = (
+                    f"EXIT {position.position_type.upper()} ({exit_reason}): "
+                    f"Entry: {position.entry_price:.8f} | Exit: {exit_price:.8f} | "
+                    f"Shares: {position.shares:.4f} | "
+                    f"PnL: {net_pnl:.4f} USDT | "
+                    f"Fees: {position.entry_fee + position.exit_fee:.4f} USDT | "
+                    f"Balance: {curr_balance:.2f} USDT"
+                )
+
+                exit_log_entry = {
+                    'timestamp': position.exit_time,
+                    'message': trade_log,
+                    'type': 'exit',
+                    'position_id': position.id,
+                    'position_type': position.position_type,
+                    'entry_price': position.entry_price,
+                    'exit_price': exit_price,
+                    'pnl': net_pnl,
+                    'exit_reason': exit_reason
+                }
+                trade_log_global.append(exit_log_entry)
+
+                positions_to_remove.append(position)
+                logging.info(f"\n{'='*60}")
+                logging.info(f"Position Closed: {position.position_type.upper()}")
+                logging.info(f"Entry: {position.entry_price:.8f} | Exit: {exit_price:.8f}")
+                logging.info(f"Net PnL: {net_pnl:.4f} USDT | Balance: {curr_balance:.2f} USDT")
+                logging.info(f"{'='*60}")
+
+        active_positions = [p for p in active_positions if p not in positions_to_remove]
+
+def calculate_position_size(price):
+    """FIXED: Returns the number of shares to buy based on full capital usage."""
+    global current_balance
+    # Use POSITION_SIZE_PCT of current balance
+    usable_capital = current_balance * POSITION_SIZE_PCT
+    # Apply leverage
+    usable_capital *= LEVERAGE
+    # How many shares we can afford
+    shares = usable_capital / price
+    # Ensure at least 1 share
+    if shares < 1:
+        shares = 1
+    return shares
+
+def swish(x):
+    return tf.nn.swish(x)
+
+tf.keras.utils.get_custom_objects().update({'swish': swish})
+
+def update_status_display(status):
+    global last_status_length
+    sys.stdout.write('\r' + ' ' * last_status_length)
+    sys.stdout.write('\r' + status)
+    sys.stdout.flush()
+    last_status_length = len(status)
+
+def clean_data(df):
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df.fillna(method='ffill', inplace=True)
+    df.fillna(method='bfill', inplace=True)
+    df.fillna(0, inplace=True)
+    return df
+
+def calculate_candlestick_features_research(df):
+    df['real_body'] = abs(df['close'] - df['open'])
+    df['upper_shadow'] = df['high'] - np.maximum(df['open'], df['close'])
+    df['lower_shadow'] = np.minimum(df['open'], df['close']) - df['low']
+    return df
+
+def initialize_scalers(df):
+    global lstm_scaler, cnn_scaler, target_scaler, culr_scaler
+
+    lstm_features = [
+        'log_close', 'close_diff', 'rsi', 'mom',
+        'ema_5', 'ema_10', 'ema_20', 'ema_50',
+        'close_ema_5_ratio', 'close_ema_10_ratio',
+        'close_ema_20_ratio', 'close_ema_50_ratio',
+        'roc_5', 'roc_10', 'roc_15',
+        'volatility_10', 'volatility_20'
+    ]
+
+    culr_features = ['close', 'upper_shadow', 'lower_shadow', 'real_body']
+
+    df = clean_data(df)
+    if len(df) > 0:
+        for feature in lstm_features:
+            if feature not in df.columns:
+                if feature in ['rsi', 'mom']:
+                    df[feature] = 50.0
+                elif 'volatility' in feature:
+                    df[feature] = 0.0
+                elif 'ratio' in feature:
+                    df[feature] = 1.0
+                else:
+                    df[feature] = 0.0
+
+        lstm_scaler.fit(df[lstm_features].values)
+        logging.info(f"LSTM scaler fitted with {len(lstm_features)} features")
+
+        culr_scaler = MinMaxScaler(feature_range=(0, 1))
+        if all(col in df.columns for col in culr_features):
+            culr_scaler.fit(df[culr_features].values)
+            logging.info("CULR scaler fitted successfully")
+
+        df['ema'] = talib.EMA(df['close'], timeperiod=EMA_PERIOD)
+        ema_shifted = df['ema'].shift(-TARGET_LOOKAHEAD)
+        valid_indices = ~ema_shifted.isna()
+        if np.sum(valid_indices) > 0:
+            predicted_diff = (ema_shifted[valid_indices] - df['ema'][valid_indices]) / ALPHA
+            target_scaler.fit(predicted_diff.values.reshape(-1, 1))
+            logging.info("Target scaler fitted successfully")
+
+        legacy_cnn_features = [
+            'log_close', 'close_diff', 'price_range', 'body_size', 'upper_shadow', 'lower_shadow',
+            'rsi', 'mom', 'stoch_k', 'stoch_d', 'sma_10', 'sma_20', 'ema_12', 'ema_26',
+            'macd', 'macd_signal', 'macd_hist', 'bb_upper', 'bb_middle', 'bb_lower',
+            'bb_width', 'bb_position', 'volume_ratio', 'atr', 'volatility'
+        ]
+        if all(col in df.columns for col in legacy_cnn_features):
+            cnn_scaler.fit(df[legacy_cnn_features].values)
+            logging.info("CNN scaler fitted successfully")
+
+def load_sarimax_model():
+    global sarimax_model, sarimax_scaler_x, sarimax_scaler_y, sarimax_metadata
+
+    try:
+        if os.path.exists('sarimax_model_coindcx_optimized.h5'):
+            with open('sarimax_model_coindcx_optimized.h5', 'rb') as f:
+                sarimax_model = pickle.load(f)
+            logging.info("SARIMAX model loaded successfully using pickle")
+        else:
+            logging.warning("SARIMAX model file not found")
+            return False
+
+        if os.path.exists('sarimax_scaler_x.pkl'):
+            sarimax_scaler_x = joblib.load('sarimax_scaler_x.pkl')
+            logging.info("SARIMAX X scaler loaded successfully")
+        else:
+            logging.warning("SARIMAX X scaler file not found")
+            return False
+
+        if os.path.exists('sarimax_scaler_y.pkl'):
+            sarimax_scaler_y = joblib.load('sarimax_scaler_y.pkl')
+            logging.info("SARIMAX Y scaler loaded successfully")
+        else:
+            logging.warning("SARIMAX Y scaler file not found")
+            return False
+
+        if os.path.exists('sarimax_metadata.pkl'):
+            sarimax_metadata = joblib.load('sarimax_metadata.pkl')
+            logging.info("SARIMAX metadata loaded successfully")
+        else:
+            logging.warning("SARIMAX metadata file not found")
+            return False
+
+        return True
+
+    except Exception as e:
+        logging.error(f"Error loading SARIMAX model: {e}")
+        return False
+
+def load_models(model=None):
+    global lstm_model, cnn_model, models_loaded, pattern_label_encoder, pattern_mapping, culr_scaler
+    custom_objects = {'swish': swish}
+
+    try:
+        if model == 'LSTM':
+            if os.path.exists("lstm_model_coindcx_optimized.h5"):
+                try:
+                    lstm_model = load_model("lstm_model_coindcx_optimized.h5", compile=False, custom_objects=custom_objects)
+                    logging.info("LSTM model loaded successfully")
+                    lstm_model.summary()
+                    input_shape = lstm_model.input_shape
+                    logging.info(f"LSTM model expects input shape: {input_shape}")
+
+                except Exception as e:
+                    logging.error(f"Error loading LSTM model: {e}")
+                    logging.warning("Creating dummy LSTM model instead")
+                    create_dummy_lstm_model()
+            else:
+                logging.warning("LSTM model file not found - creating dummy model")
+                create_dummy_lstm_model()
+
+        elif model == 'CNN':
+            research_cnn_loaded = False
+            for window_size in [60, 100]:
+                if os.path.exists(f"candlestick_cnn_best_{window_size}x{window_size}.h5"):
+                    cnn_model = load_model(f"candlestick_cnn_best_{window_size}x{window_size}.h5",
+                                         compile=False, custom_objects=custom_objects)
+                    logging.info(f"Research-based CNN model loaded ({window_size}x{window_size})")
+
+                    if os.path.exists(f'pattern_label_encoder_{window_size}.pkl'):
+                        pattern_label_encoder = joblib.load(f'pattern_label_encoder_{window_size}.pkl')
+                    if os.path.exists(f'pattern_mapping_{window_size}.pkl'):
+                        pattern_mapping = joblib.load(f'pattern_mapping_{window_size}.pkl')
+
+                    research_cnn_loaded = True
+                    break
+
+            if not research_cnn_loaded:
+                if os.path.exists("candlestick_pattern_classifier.h5"):
+                    cnn_model = load_model("candlestick_pattern_classifier.h5", compile=False, custom_objects=custom_objects)
+                    logging.info("Legacy CNN pattern classifier loaded successfully")
+                else:
+                    logging.warning("CNN model file not found - creating dummy model")
+                    create_dummy_cnn_model()
+
+            if os.path.exists('culr_feature_scaler.pkl'):
+                culr_scaler = joblib.load('culr_feature_scaler.pkl')
+                logging.info("CULR feature scaler loaded successfully")
+
+            if pattern_label_encoder is None:
+                try:
+                    pattern_label_encoder = joblib.load('pattern_label_encoder.pkl')
+                    pattern_mapping = joblib.load('pattern_mapping.pkl')
+                    logging.info("Legacy pattern encoders loaded successfully")
+                except Exception as e:
+                    logging.warning(f"Could not load pattern encoders: {e}")
+                    create_fallback_encoders()
+
+        elif model == 'SARIMAX':
+            load_sarimax_model()
+
+        if lstm_model is not None and cnn_model is not None:
+            models_loaded = True
+            logging.info("All models loaded successfully!")
+        return True
+    except Exception as e:
+        logging.error(f"Error loading {model} model: {str(e)}")
+        return False
+
+def create_dummy_lstm_model():
+    global lstm_model
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization
+
+    model = Sequential([
+        LSTM(128, return_sequences=True, input_shape=(LOOKBACK, 17)),
+        BatchNormalization(),
+        Dropout(0.3),
+        LSTM(64, return_sequences=True),
+        BatchNormalization(),
+        Dropout(0.3),
+        LSTM(32),
+        BatchNormalization(),
+        Dropout(0.3),
+        Dense(1)
+    ])
+    model.compile(optimizer='adam', loss='mse')
+    lstm_model = model
+    logging.info("Created dummy LSTM model with 17 features")
+
+def create_dummy_cnn_model():
+    global cnn_model
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense
+
+    model = Sequential([
+        Conv2D(32, (3, 3), activation='relu', input_shape=(WINDOW_SIZE, WINDOW_SIZE, 4)),
+        MaxPooling2D(2, 2),
+        Flatten(),
+        Dense(64, activation='relu'),
+        Dense(len(MAIN_CANDLE_PATTERNS) + 1, activation='softmax')
+    ])
+    model.compile(optimizer='adam', loss='categorical_crossentropy')
+    cnn_model = model
+    logging.info("Created dummy CNN model with CULR features")
+
+def create_fallback_encoders():
+    global pattern_label_encoder, pattern_mapping
+    from sklearn.preprocessing import LabelEncoder
+
+    research_patterns = ['BULLISH_ENGULFING', 'BEARISH_ENGULFING', 'BULLISH_HARAMI', 'BEARISH_HARAMI',
+                        'HAMMER', 'SHOOTING_STAR', 'CDLMORNINGSTAR', 'CDLDOJI', 'NO_PATTERN']
+
+    pattern_label_encoder = LabelEncoder()
+    pattern_label_encoder.fit(research_patterns)
+
+    pattern_mapping = {i: pattern for i, pattern in enumerate(research_patterns)}
+
+    logging.info("Created fallback research-based pattern encoders")
+
+def detect_candle_patterns_research_based(df):
+    pattern_results = {}
+
+    df['ma_5h'] = talib.SMA(df['close'], timeperiod=5)
+
+    for pattern in MAIN_CANDLE_PATTERNS:
+        try:
+            pattern_func = getattr(talib, pattern)
+            pattern_results[pattern] = pattern_func(df['open'], df['high'], df['low'], df['close'])
+        except Exception as e:
+            logging.warning(f"Error detecting pattern {pattern}: {e}")
+            pattern_results[pattern] = np.zeros(len(df))
+
+    return pattern_results, df
+
+def create_pattern_labels_research_based(pattern_results, df):
+    labels = []
+    pattern_names = list(MAIN_CANDLE_PATTERNS)
+
+    pattern_df = pd.DataFrame(pattern_results)
+
+    for idx in range(len(pattern_df)):
+        if idx < 5:
+            labels.append('NO_PATTERN')
+            continue
+
+        row = pattern_df.iloc[idx]
+
+        recent_closes = df['close'].iloc[idx-4:idx+1]
+        ma_5h = df['ma_5h'].iloc[idx]
+
+        closes_below_ma = (recent_closes < ma_5h).sum()
+        trend = 'DOWN' if closes_below_ma >= 3 else 'UP'
+
+        detected_patterns = []
+
+        for pattern in pattern_names:
+            pattern_value = row[pattern]
+
+            if pattern_value != 0:
+                if pattern == 'CDLENGULFING':
+                    if pattern_value > 0:
+                        detected_patterns.append('BULLISH_ENGULFING')
+                    elif pattern_value < 0:
+                        detected_patterns.append('BEARISH_ENGULFING')
+                elif pattern == 'CDLHARAMI':
+                    if pattern_value > 0:
+                        detected_patterns.append('BULLISH_HARAMI')
+                    elif pattern_value < 0:
+                        detected_patterns.append('BEARISH_HARAMI')
+                elif pattern == 'CDLHAMMER':
+                    detected_patterns.append('HAMMER')
+                elif pattern == 'CDLSHOOTINGSTAR':
+                    detected_patterns.append('SHOOTING_STAR')
+                else:
+                    detected_patterns.append(pattern)
+
+        if len(detected_patterns) == 0:
+            labels.append('NO_PATTERN')
+        elif len(detected_patterns) == 1:
+            labels.append(detected_patterns[0])
+        else:
+            priority_order = [
+                'BULLISH_ENGULFING', 'BEARISH_ENGULFING', 'BULLISH_HARAMI', 'BEARISH_HARAMI',
+                'HAMMER', 'SHOOTING_STAR', 'CDLMORNINGSTAR', 'CDLDOJI'
+            ]
+
+            for priority_pattern in priority_order:
+                if priority_pattern in detected_patterns:
+                    labels.append(priority_pattern)
+                    break
+
+    return labels
+
+def prepare_lstm_features(df):
+    features = [
+        'log_close', 'close_diff', 'rsi', 'mom',
+        'ema_5', 'ema_10', 'ema_20', 'ema_50',
+        'close_ema_5_ratio', 'close_ema_10_ratio',
+        'close_ema_20_ratio', 'close_ema_50_ratio',
+        'roc_5', 'roc_10', 'roc_15',
+        'volatility_10', 'volatility_20'
+    ]
+
+    df = clean_data(df)
+
+    for feature in features:
+        if feature not in df.columns:
+            logging.warning(f"Creating missing feature: {feature}")
+            if feature in ['rsi', 'mom']:
+                df[feature] = 50.0
+            elif 'volatility' in feature:
+                df[feature] = 0.0
+            elif 'ratio' in feature:
+                df[feature] = 1.0
+            else:
+                df[feature] = 0.0
+
+    df_subset = df[features].tail(LOOKBACK)
+
+    if len(df_subset) < LOOKBACK:
+        logging.warning(f"Not enough data for LSTM: {len(df_subset)} < {LOOKBACK}")
+        padding_rows = LOOKBACK - len(df_subset)
+        first_row = df_subset.iloc[0:1]
+        padding = pd.DataFrame([first_row.values[0]] * padding_rows, columns=df_subset.columns)
+        df_subset = pd.concat([padding, df_subset], ignore_index=True)
+
+    return df_subset.values, features
+
+def get_lstm_prediction(df):
+    global lstm_model, lstm_scaler, target_scaler, lstm_mae
+
+    if lstm_model is None:
+        return 0, 0.0, 0.0, 0.0
+
+    if len(df) < LOOKBACK:
+        return 0, 0.0, 0.0, 0.0
+
+    try:
+        lstm_X, feature_names = prepare_lstm_features(df)
+
+        if not hasattr(lstm_scaler, 'scale_') or lstm_scaler.scale_ is None:
+            return 0, 0.0, 0.0, 0.0
+
+        if not hasattr(target_scaler, 'scale_') or target_scaler.scale_ is None:
+            return 0, 0.0, 0.0, 0.0
+
+        try:
+            scaled_data = lstm_scaler.transform(lstm_X)
+        except ValueError as e:
+            logging.error(f"Error scaling LSTM data: {e}")
+            return 0, 0.0, 0.0, 0.0
+
+        lstm_input = scaled_data.reshape((1, LOOKBACK, len(feature_names)))
+
+        predicted_diff_scaled = lstm_model.predict(lstm_input, verbose=0)
+        predicted_diff = target_scaler.inverse_transform(predicted_diff_scaled)[0][0]
+
+        current_ema = df['ema'].iloc[-1]
+        predicted_price = current_ema + (ALPHA * predicted_diff)
+        current_price = df['close'].iloc[-1]
+        price_diff = predicted_price - current_price
+
+        price_change_pct = abs(price_diff) / current_price
+
+        signal = 0
+        confidence = 0.0
+
+        if price_diff > current_price * 0.0002:
+            signal = 1
+            base_confidence = min(price_change_pct / 0.002, 1.0)
+
+            if base_confidence > 0.05:
+                momentum = df['mom'].iloc[-1] if 'mom' in df.columns else 0
+                if momentum > 0:
+                    momentum_boost = min(momentum / 20.0, 0.2)
+                    confidence = min(base_confidence + momentum_boost, 1.0)
+                else:
+                    confidence = base_confidence * 0.8
+            else:
+                confidence = base_confidence
+
+        elif price_diff < -current_price * 0.0002:
+            signal = 2
+            base_confidence = min(price_change_pct / 0.002, 1.0)
+
+            if base_confidence > 0.05:
+                momentum = df['mom'].iloc[-1] if 'mom' in df.columns else 0
+                if momentum < 0:
+                    momentum_boost = min(abs(momentum) / 20.0, 0.2)
+                    confidence = min(base_confidence + momentum_boost, 1.0)
+                else:
+                    confidence = base_confidence * 0.8
+            else:
+                confidence = base_confidence
+
+        if signal != 0:
+            if confidence < 0.08:
+                signal = 0
+                confidence = 0.0
+            elif confidence < 0.12:
+                confidence = 0.12
+
+        logging.info(f"LSTM Prediction: signal={signal}, confidence={confidence:.3f}, "
+                    f"price_diff={price_diff:.6f}, price_change_pct={price_change_pct:.4%}, "
+                    f"predicted_diff={predicted_diff:.8f}")
+
+        return signal, confidence, predicted_price, predicted_diff
+
+    except Exception as e:
+        logging.error(f"LSTM prediction error: {e}")
+        import traceback
+        logging.error(traceback.format_exc())
+        return 0, 0.0, 0.0, 0.0
+
+def create_gaf_images_research_method(data, columns, window_size, method='difference'):
+    gaf = GramianAngularField(method=method, image_size=window_size)
+
+    if len(data) < window_size:
+        return None
+
+    try:
+        window_data = data[columns].tail(window_size).values.T.astype(np.float64)
+        gaf_image = gaf.fit_transform(window_data)
+        return gaf_image
+    except Exception as e:
+        logging.error(f"Error creating GAF image: {e}")
+        return None
+
+def get_cnn_prediction(df):
+    global cnn_model, pattern_label_encoder, cnn_scaler, culr_scaler
+
+    if cnn_model is None or len(df) < WINDOW_SIZE:
+        return 0, 0.0, "NO_PATTERN"
+
+    try:
+        df_with_features = calculate_candlestick_features_research(df.copy())
+        pattern_results, df_enhanced = detect_candle_patterns_research_based(df_with_features)
+        pattern_labels = create_pattern_labels_research_based(pattern_results, df_enhanced)
+        current_pattern = pattern_labels[-1] if pattern_labels else 'NO_PATTERN'
+
+        signal = 0
+        confidence = 0.0
+
+        strong_bullish = ['BULLISH_ENGULFING', 'CDLMORNINGSTAR']
+        strong_bearish = ['BEARISH_ENGULFING']
+
+        medium_bullish = ['BULLISH_HARAMI', 'HAMMER']
+        medium_bearish = ['BEARISH_HARAMI', 'SHOOTING_STAR']
+
+        if current_pattern in strong_bullish:
+            signal = 1
+            confidence = 0.55
+        elif current_pattern in strong_bearish:
+            signal = 2
+            confidence = 0.55
+        elif current_pattern in medium_bullish:
+            signal = 1
+            confidence = 0.35
+        elif current_pattern in medium_bearish:
+            signal = 2
+            confidence = 0.35
+        elif current_pattern == 'CDLDOJI':
+            recent_trend = df['close'].iloc[-5:].pct_change().mean()
+            if recent_trend > 0.001:
+                signal = 2
+                confidence = 0.25
+            elif recent_trend < -0.001:
+                signal = 1
+                confidence = 0.25
+        else:
+            signal = 0
+            confidence = 0.1
+
+        return signal, confidence, current_pattern
+
+    except Exception as e:
+        logging.error(f"CNN prediction error: {e}")
+        return 0, 0.0, "ERROR"
+
+def prepare_sarimax_features(df):
+    features = [
+        'log_close', 'close_diff', 'returns',
+        'rsi', 'mom', 'cci',
+        'macd', 'macd_signal', 'macd_hist',
+        'bb_position', 'bb_width',
+        'ema_5', 'ema_10', 'ema_20', 'ema_50',
+        'close_ema_5_ratio', 'close_ema_10_ratio',
+        'close_ema_20_ratio', 'close_ema_50_ratio',
+        'ema_5_10_cross', 'ema_10_20_cross',
+        'roc_5', 'roc_10', 'roc_15',
+        'volatility_10', 'volatility_20', 'atr',
+        'volume_ratio',
+        'adx', 'plus_di', 'minus_di',
+        'slowk', 'slowd'
+    ]
+
+    df = clean_data(df)
+
+    available_features = [f for f in features if f in df.columns]
+    missing_features = [f for f in features if f not in df.columns]
+
+    if missing_features:
+        logging.warning(f"Missing features for SARIMAX: {missing_features}")
+        for feature in missing_features:
+            df[feature] = 0
+
+    return df[features].tail(1).copy(), features
+
+def get_sarimax_prediction(df):
+    global sarimax_model, sarimax_scaler_x, sarimax_scaler_y, sarimax_metadata
+
+    if (sarimax_model is None or sarimax_scaler_x is None or
+        sarimax_scaler_y is None or sarimax_metadata is None):
+        return 0, 0.0, 0.0
+
+    try:
+        exog, feat = prepare_sarimax_features(df)
+
+        feature_names = sarimax_metadata.get('feature_names', [])
+        if not feature_names:
+            feature_names = feat
+
+        available_features = [f for f in feature_names if f in exog.columns]
+        if len(available_features) != sarimax_scaler_x.n_features_in_:
+            return 0, 0.0, 0.0
+
+        exog = exog[available_features]
+        exog_scaled = sarimax_scaler_x.transform(exog.values)
+
+        forecast_scaled = sarimax_model.forecast(steps=1, exog=exog_scaled)
+
+        if hasattr(forecast_scaled, 'values'):
+            forecast_value = forecast_scaled.values[0]
+        elif isinstance(forecast_scaled, (pd.Series, pd.DataFrame)):
+            forecast_value = forecast_scaled.iloc[0]
+        else:
+            forecast_value = forecast_scaled
+
+        predicted_diff = sarimax_scaler_y.inverse_transform(
+            np.array(forecast_value).reshape(-1, 1)
+        )[0][0]
+
+        current_ema = df['ema'].iloc[-1]
+        predicted_price = current_ema + (ALPHA * predicted_diff)
+        current_price = df['close'].iloc[-1]
+        price_diff = predicted_price - current_price
+
+        price_change_pct = abs(price_diff) / current_price
+
+        signal = 0
+        confidence = 0.0
+
+        min_movement_threshold = current_price * 0.0001
+
+        if abs(price_diff) < min_movement_threshold:
+            signal = 0
+            confidence = 0.0
+
+        elif price_diff > min_movement_threshold:
+            signal = 1
+            confidence = min(price_change_pct / 0.005, 0.8)
+
+        elif price_diff < -min_movement_threshold:
+            signal = 2
+            confidence = min(price_change_pct / 0.005, 0.8)
+
+        if signal != 0:
+            price_ratio = predicted_price / current_price
+            if price_ratio > 1.05 or price_ratio < 0.95:
+                signal = 0
+                confidence = 0.0
+
+            if confidence > 0.95:
+                confidence = 0.95
+
+        return signal, confidence, predicted_price
+
+    except Exception as e:
+        logging.error(f"SARIMAX prediction error: {e}")
+        return 0, 0.0, 0.0
+
+def generate_combined_signal(df):
+    global latest_signal_data
+
+    lstm_signal, lstm_confidence, predicted_price_lstm, predicted_diff_lstm = get_lstm_prediction(df)
+    cnn_signal, cnn_confidence, pattern_name = get_cnn_prediction(df)
+    sarimax_signal, sarimax_confidence, predicted_price_sarimax = get_sarimax_prediction(df)
+
+    current_price = df['close'].iloc[-1]
+
+    current_rsi = df['rsi'].iloc[-1] if 'rsi' in df.columns else 0.0
+    current_bb_position = df['bb_position'].iloc[-1] if 'bb_position' in df.columns else 0.0
+    current_volume_ratio = df['volume_ratio'].iloc[-1] if 'volume_ratio' in df.columns else 0.0
+    current_macd_hist = df['macd_hist'].iloc[-1] if 'macd_hist' in df.columns else 0.0
+
+    MULTI_MODEL_THRESHOLD = 0.08
+
+    valid_signals = []
+
+    if lstm_signal != 0 and lstm_confidence >= MULTI_MODEL_THRESHOLD:
+        valid_signals.append(('LSTM', lstm_signal, lstm_confidence))
+
+    if cnn_signal != 0 and cnn_confidence >= MULTI_MODEL_THRESHOLD:
+        valid_signals.append(('CNN_Research', cnn_signal, cnn_confidence))
+
+    if sarimax_signal != 0 and sarimax_confidence >= MULTI_MODEL_THRESHOLD:
+        valid_signals.append(('SARIMAX', sarimax_signal, sarimax_confidence))
+
+    final_signal = 0
+    final_confidence = 0.0
+    consensus_achieved = False
+    signal_reason = "No consensus"
+    agreeing_models_count = 0
+
+    logging.info(f"Valid signals count: {len(valid_signals)}")
+    for name, sig, conf in valid_signals:
+        logging.info(f"  {name}: signal={sig}, confidence={conf:.3f}")
+
+    if len(valid_signals) >= 2:
+        bullish_signals = [s for s in valid_signals if s[1] == 1]
+        bearish_signals = [s for s in valid_signals if s[1] == 2]
+
+        if len(bullish_signals) >= 2:
+            final_signal = 1
+            final_confidence = np.mean([s[2] for s in bullish_signals])
+            model_names = [s[0] for s in bullish_signals]
+            signal_reason = f"Multi-Model Bullish: {', '.join(model_names[:2])}"
+            consensus_achieved = True
+            agreeing_models_count = len(bullish_signals)
+
+        elif len(bearish_signals) >= 2:
+            final_signal = 2
+            final_confidence = np.mean([s[2] for s in bearish_signals])
+            model_names = [s[0] for s in bearish_signals]
+            signal_reason = f"Multi-Model Bearish: {', '.join(model_names[:2])}"
+            consensus_achieved = True
+            agreeing_models_count = len(bearish_signals)
+
+    if not consensus_achieved and len(valid_signals) > 0:
+        strongest_model = max(valid_signals, key=lambda x: x[2])
+        model_name, model_signal, model_confidence = strongest_model
+
+        if model_confidence >= 0.15:
+            final_signal = model_signal
+            final_confidence = model_confidence
+            signal_reason = f"Single Model: {model_name} ({model_confidence:.1%} confidence)"
+            consensus_achieved = True
+            agreeing_models_count = 1
+
+    if not consensus_achieved and len(valid_signals) >= 2:
+        all_signals_same = all(s[1] == valid_signals[0][1] for s in valid_signals)
+        if all_signals_same:
+            final_signal = valid_signals[0][1]
+            final_confidence = np.mean([s[2] for s in valid_signals])
+            model_names = [s[0] for s in valid_signals]
+            signal_reason = f"Unanimous Direction: {', '.join(model_names)}"
+            consensus_achieved = True
+            agreeing_models_count = len(valid_signals)
+
+    latest_signal_data = {
+        'signal': final_signal,
+        'confidence': final_confidence,
+        'reason': signal_reason,
+        'lstm_signal': lstm_signal,
+        'lstm_confidence': lstm_confidence,
+        'cnn_signal': cnn_signal,
+        'cnn_confidence': cnn_confidence,
+        'pattern': pattern_name,
+        'sarimax_signal': sarimax_signal,
+        'sarimax_confidence': sarimax_confidence,
+        'consensus_achieved': consensus_achieved,
+        'current_price': current_price,
+        'rsi': current_rsi,
+        'bb_position': current_bb_position,
+        'volume_ratio': current_volume_ratio,
+        'macd_hist': current_macd_hist,
+        'valid_signals_count': len(valid_signals),
+        'agreeing_models': agreeing_models_count
+    }
+
+    return latest_signal_data
+
+def execute_trade(signal_data, current_price):
+    global trade_log_global, current_balance, last_trade_time, active_positions, order_status
+
+    signal = signal_data['signal']
+    confidence = signal_data['confidence']
+    reason = signal_data['reason']
+
+    if not signal_data.get('consensus_achieved', False):
+        logging.info(f"No trade: {reason}")
+        return
+
+    if last_trade_time and (datetime.datetime.now() - last_trade_time) < min_time_between_trades:
+        return
+
+    if order_status == 'open':
+        logging.info("Order already pending - skipping new trade")
+        return
+
+    # ============================================================
+    # FIXED: dynamically calculate shares from current balance
+    # ============================================================
+    shares = calculate_position_size(current_price)
+    logging.info(f"Calculated position size: {shares:.4f} BIO "
+                 f"(balance={current_balance:.2f} USDT, price={current_price:.8f}, "
+                 f"pct={POSITION_SIZE_PCT}, leverage={LEVERAGE})")
+
+    if shares <= 0:
+        logging.info("Calculated shares <= 0, skipping trade")
+        return
+
+    if not can_open_new_position():
+        logging.info("Cannot open new position - max positions reached")
+        return
+
+    if not is_valid_new_position("long" if signal == 1 else "short", current_price):
+        logging.info("Invalid position - too close to existing position")
+        return
+
+    predicted_price = signal_data.get('current_price', current_price)
+    predicted_diff = predicted_price - current_price
+
+    position_type = "long" if signal == 1 else "short"
+
+    new_position = TradePosition(
+        position_type,
+        current_price,
+        shares,
+        predicted_price - current_price,
+        predicted_diff
+    )
+
+    with position_lock:
+        active_count = sum(1 for position in active_positions if not position.exited)
+        if active_count >= max_positions:
+            logging.info("Max positions reached - cancelling trade execution")
+            return
+
+        active_positions.append(new_position)
+        last_trade_time = datetime.datetime.now()
+
+    trade_time = datetime.datetime.now()
+
+    try:
+        order_type = "buy" if signal == 1 else "sell"
+        order_response = place_order(order_type, current_price, shares, new_position.id)
+
+        if order_response is None and REAL_TRADING_MODE:
+            logging.error("Failed to place order - removing position from active positions")
+            with position_lock:
+                if new_position in active_positions:
+                    active_positions.remove(new_position)
+            return
+    except Exception as e:
+        logging.error(f"Error placing order: {e}")
+        with position_lock:
+            if new_position in active_positions:
+                active_positions.remove(new_position)
+        return
+
+    mode_indicator = "REAL" if REAL_TRADING_MODE else "PAPER"
+
+    trade_log = (
+        f"{mode_indicator} TRADE - {'LONG' if signal == 1 else 'SHORT'} opened at {current_price:.8f} | "
+        f"Size: {shares:.4f} BIO (value={new_position.position_value:.2f} USDT) | "
+        f"Confidence: {confidence:.2%} | "
+        f"Target: {new_position.target:.8f} (+1%) | SL: {new_position.stop_loss:.8f} (-4%) | "
+        f"Balance: {current_balance:.2f} USDT | Reason: {reason}"
+    )
+
+    trade_log_entry = {
+        'timestamp': trade_time,
+        'message': trade_log,
+        'type': 'entry',
+        'position_id': new_position.id,
+        'position_type': 'long' if signal == 1 else 'short',
+        'entry_price': current_price,
+        'shares': shares,
+        'predicted_diff': predicted_diff,
+        'target_price': new_position.target,
+        'stop_loss_price': new_position.stop_loss,
+        'trading_mode': mode_indicator,
+        'consensus_trade': True
+    }
+    trade_log_global.append(trade_log_entry)
+
+    logging.info(f"\n{'='*80}")
+    logging.info(f"TRADE EXECUTED ({mode_indicator} MODE)")
+    logging.info(f"Signal: {'LONG' if signal == 1 else 'SHORT'}")
+    logging.info(f"Shares: {shares:.4f}  |  Position Value: {new_position.position_value:.2f} USDT")
+    logging.info(f"Entry Price: {current_price:.8f}")
+    logging.info(f"Target: {new_position.target:.8f} (+1%) | Stop Loss: {new_position.stop_loss:.8f} (-4%)")
+    logging.info(f"Balance After Entry: {current_balance:.2f} USDT")
+    logging.info(f"Reason: {reason}")
+    logging.info(f"{'='*80}")
+
+@app.route('/update', methods=['POST'])
+@cross_origin()
+def update():
+    global lstm_mae, sarimax_mae
+    data = request.get_json()
+    if 'Updated' in data:
+        if load_models(model=data['Updated']):
+            return jsonify({'message': 'Update received'}), 200
+        else:
+            return jsonify({'error': 'Failed to load models'}), 400
+    if 'LSTM' in data:
+        lstm_mae = float(data['LSTM'])
+        logging.info(f'LSTM MAE updated to {lstm_mae}')
+        return jsonify({'message': f'LSTM MAE updated to {lstm_mae}'}), 200
+    if 'SARIMAX' in data:
+        sarimax_mae = float(data['SARIMAX'])
+        logging.info(f'SARIMAX MAE updated to {sarimax_mae}')
+        return jsonify({'message': f'SARIMAX MAE updated to {sarimax_mae}'}), 200
+    return jsonify({'error': 'Invalid request'}), 400
+
+@app.route('/check_positions', methods=['POST'])
+@cross_origin()
+def manual_check_positions():
+    global last_price
+    if last_price:
+        logging.info(f"Manual position check triggered with price: {last_price}")
+        check_positions(last_price)
+        return jsonify({'message': f'Position check completed at price {last_price}'})
+    return jsonify({'error': 'No price data available'})
+
+def fetch_initial_data():
+    end_time = int(datetime.datetime.now().timestamp() * 1000)
+    start_time = int((datetime.datetime.now() - timedelta(days=365)).timestamp() * 1000)
+    url = f"https://public.coindcx.com/market_data/candles?pair=B-LAB_USDT&interval=1m&startTime={start_time}&endTime={end_time}"
+    try:
+        response = requests.get(url)
+        data = response.json()
+        df = pd.DataFrame(data).rename(columns={
+            'open': 'open', 'high': 'high', 'low': 'low',
+            'volume': 'volume', 'close': 'close'
+        })
+        df['time'] = pd.to_datetime(df['time'], unit='ms')
+        df[['open', 'high', 'low', 'close', 'volume']] = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
+
+        df = calculate_all_features(df)
+        return df
+    except Exception as e:
+        logging.error(f"Error fetching initial data: {e}")
+        return None
+
+def calculate_all_features(df):
+    df['log_close'] = np.log(df['close'])
+    df['close_diff'] = df['close'].diff()
+    df['price_range'] = df['high'] - df['low']
+    df['body_size'] = abs(df['close'] - df['open'])
+    df['upper_shadow'] = df['high'] - np.maximum(df['open'], df['close'])
+    df['lower_shadow'] = np.minimum(df['open'], df['close']) - df['low']
+
+    df['real_body'] = abs(df['close'] - df['open'])
+
+    df['rsi'] = talib.RSI(df['close'], timeperiod=14)
+    df['mom'] = talib.MOM(df['close'], timeperiod=10)
+    df['cci'] = talib.CCI(df['high'], df['low'], df['close'], timeperiod=14)
+
+    df['slowk'], df['slowd'] = talib.STOCH(
+        df['high'], df['low'], df['close'],
+        fastk_period=14, slowk_period=3, slowd_period=3
+    )
+
+    df['macd'], df['macd_signal'], df['macd_hist'] = talib.MACD(
+        df['close'], fastperiod=12, slowperiod=26, signalperiod=9
+    )
+
+    df['ema_5'] = talib.EMA(df['close'], timeperiod=5)
+    df['ema_10'] = talib.EMA(df['close'], timeperiod=10)
+    df['ema_12'] = talib.EMA(df['close'], timeperiod=12)
+    df['ema_20'] = talib.EMA(df['close'], timeperiod=20)
+    df['ema_26'] = talib.EMA(df['close'], timeperiod=26)
+    df['ema_50'] = talib.EMA(df['close'], timeperiod=50)
+    df['sma_10'] = talib.SMA(df['close'], timeperiod=10)
+    df['sma_20'] = talib.SMA(df['close'], timeperiod=20)
+
+    df['ma_5h'] = talib.SMA(df['close'], timeperiod=5)
+
+    df['close_ema_5_ratio'] = df['close'] / df['ema_5']
+    df['close_ema_10_ratio'] = df['close'] / df['ema_10']
+    df['close_ema_20_ratio'] = df['close'] / df['ema_20']
+    df['close_ema_50_ratio'] = df['close'] / df['ema_50']
+
+    df['ema_5_10_cross'] = df['ema_5'] - df['ema_10']
+    df['ema_10_20_cross'] = df['ema_10'] - df['ema_20']
+
+    df['roc_5'] = talib.ROC(df['close'], timeperiod=5)
+    df['roc_10'] = talib.ROC(df['close'], timeperiod=10)
+    df['roc_15'] = talib.ROC(df['close'], timeperiod=15)
+
+    df['bb_upper'], df['bb_middle'], df['bb_lower'] = talib.BBANDS(
+        df['close'], timeperiod=20, nbdevup=2, nbdevdn=2
+    )
+    df['bb_width'] = (df['bb_upper'] - df['bb_lower']) / df['bb_middle']
+    df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
+
+    df['volume_sma'] = talib.SMA(df['volume'], timeperiod=20)
+    df['volume_ratio'] = df['volume'] / df['volume_sma']
+
+    df['returns'] = df['close'].pct_change()
+    df['volatility_10'] = df['returns'].rolling(10, min_periods=1).std()
+    df['volatility_20'] = df['returns'].rolling(20, min_periods=1).std()
+    df['volatility'] = df['returns'].rolling(20, min_periods=1).std()
+    df['atr'] = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14)
+
+    df['adx'] = talib.ADX(df['high'], df['low'], df['close'], timeperiod=14)
+    df['plus_di'] = talib.PLUS_DI(df['high'], df['low'], df['close'], timeperiod=14)
+    df['minus_di'] = talib.MINUS_DI(df['high'], df['low'], df['close'], timeperiod=14)
+
+    df['ema'] = talib.EMA(df['close'], timeperiod=EMA_PERIOD)
+    df['current_ema'] = talib.EMA(df['close'], timeperiod=EMA_PERIOD)
+
+    df = clean_data(df)
+    return df
+
+def predict(df):
+    global current_status, last_price, full_data, active_positions, latest_signal_data
+
+    try:
+        df = df.copy()
+        df = calculate_all_features(df)
+        full_data = df.to_dict('records')
+
+        current_price = df['close'].iloc[-1]
+        last_price = current_price
+
+        if len(df) < LOOKBACK:
+            current_status = f"Collecting data... {len(df)}/{LOOKBACK} required"
+            update_status_display(current_status)
+            return
+
+        check_positions(current_price)
+
+        signal_data = generate_combined_signal(df)
+
+        if signal_data['signal'] in [1, 2] and signal_data['consensus_achieved']:
+            logging.info(f"CONSENSUS ACHIEVED - Executing trade: {signal_data['reason']}")
+            execute_trade(signal_data, current_price)
+
+        mode_indicator = "REAL" if REAL_TRADING_MODE else "PAPER"
+        consensus_status = "CONSENSUS ACHIEVED" if signal_data['consensus_achieved'] else "NO CONSENSUS"
+        current_status = (
+            f"Price: {current_price:.6f} | "
+            f"LSTM: Signal={signal_data['lstm_signal']}, Conf={signal_data['lstm_confidence']:.2%} | "
+            f"CNN_Research: Signal={signal_data['cnn_signal']}, Conf={signal_data['cnn_confidence']:.2%}, Pattern={signal_data['pattern']} | "
+            f"SARIMAX: Signal={signal_data.get('sarimax_signal', 0)}, Conf={signal_data.get('sarimax_confidence', 0.0):.2%} | "
+            f"Consensus: {consensus_status} | "
+            f"Signal: {signal_data['signal']} | Conf: {signal_data['confidence']:.2%} | "
+            f"RSI: {signal_data['rsi']:.1f} | BB: {signal_data['bb_position']:.2f} | "
+            f"Vol: {signal_data['volume_ratio']:.2f} | MACD: {signal_data['macd_hist']:.6f} | "
+            f"Positions: {len([p for p in active_positions if not p.exited])}/{max_positions} | "
+            f"Balance: {current_balance:.2f} | PnL: {total_pnl:.2f} | "
+            f"Order Status: {order_status} | "
+            f"Reason: {signal_data['reason'][:100]}... | MODE: {mode_indicator}"
+        )
+        update_status_display(current_status)
+
+    except Exception as e:
+        import traceback
+        error_msg = f"Predict error: {str(e)}\n{traceback.format_exc()}"
+        current_status = error_msg
+        update_status_display(current_status)
+        logging.error(error_msg)
+
+# WebSocket handling
+last_minute = None
+data_lock = threading.Lock()
+current_candle = None
+
+def start_websocket():
+    socketEndpoint = 'wss://stream.coindcx.com'
+    sio = socketio.Client()
+    global full_data, last_price, current_pengu_price, last_minute, current_candle
+
+    current_candle = None
+    last_minute = None
+
+    @sio.event
+    def connect():
+        logging.info("Connected to CoinDCX WebSocket!")
+        sio.emit('join', {'channelName': "B-LAB_USDT_1m-futures"})
+
+    @sio.on('candlestick')
+    def on_message(response):
+        global full_data, last_price, current_pengu_price, last_minute, current_candle
+
+        try:
+            if isinstance(response.get('data'), str):
+                response_data = json.loads(response['data'])
+                candle_data = response_data.get('data', [{}])[0]
+            else:
+                candle_data = response.get('data', [{}])[0]
+
+            new_price = float(candle_data.get("close", 0))
+            open_price = float(candle_data.get("open", 0))
+            high_price = float(candle_data.get("high", 0))
+            low_price = float(candle_data.get("low", 0))
+            volume = float(candle_data.get("volume", 0))
+            open_time = int(candle_data.get("open_time", 0))
+
+            if new_price == 0:
+                return
+
+            last_price = new_price
+            current_pengu_price = new_price
+
+            current_time = datetime.datetime.fromtimestamp(open_time)
+            current_minute = current_time.minute
+
+            candle_completed = False
+
+            if last_minute is not None and current_minute != last_minute:
+                if current_candle is not None:
+                    full_data.append(current_candle)
+                    logging.info(f"Completed candle: O:{current_candle['open']:.6f} "
+                               f"H:{current_candle['high']:.6f} L:{current_candle['low']:.6f} "
+                               f"C:{current_candle['close']:.6f}")
+                    candle_completed = True
+
+                if len(full_data) > LOOKBACK * 2:
+                    full_data = full_data[-LOOKBACK * 2:]
+
+                current_candle = {
+                    'open': open_price,
+                    'high': high_price,
+                    'low': low_price,
+                    'close': new_price,
+                    'volume': volume,
+                    'time': current_time
+                }
+                logging.info(f"New candle started: O:{open_price:.6f} H:{high_price:.6f} "
+                           f"L:{low_price:.6f} C:{new_price:.6f}")
+
+            elif current_candle is None:
+                current_candle = {
+                    'open': open_price,
+                    'high': high_price,
+                    'low': low_price,
+                    'close': new_price,
+                    'volume': volume,
+                    'time': current_time
+                }
+                logging.info(f"First candle initialized: O:{open_price:.6f} H:{high_price:.6f} "
+                           f"L:{low_price:.6f} C:{new_price:.6f}")
+            else:
+                current_candle['high'] = max(current_candle['high'], high_price)
+                current_candle['low'] = min(current_candle['low'], low_price)
+                current_candle['close'] = new_price
+                current_candle['volume'] = volume
+
+            if len(full_data) >= LOOKBACK - 1:
+                prediction_data = full_data[-(LOOKBACK - 1):] + [current_candle]
+                df = pd.DataFrame(prediction_data)
+                predict(df)
+            elif len(full_data) > 0:
+                prediction_data = full_data + [current_candle]
+                df = pd.DataFrame(prediction_data)
+                predict(df)
+
+            last_minute = current_minute
+
+        except Exception as e:
+            logging.error(f"WebSocket error: {str(e)}")
+
+    @sio.event
+    def disconnect():
+        logging.info("Disconnected from WebSocket")
+
+    try:
+        sio.connect(socketEndpoint, transports=['websocket'])
+        logging.info("WebSocket running...")
+        sio.wait()
+    except Exception as e:
+        logging.error(f"WebSocket connection failed: {str(e)}")
+    finally:
+        sio.disconnect()
+
+@app.route('/trade_logs', methods=['GET'])
+@cross_origin()
+def serve_trade_logs():
+    global latest_signal_data
+
+    try:
+        with position_lock:
+            active_positions_data = []
+            for position in active_positions:
+                if position.exited:
+                    continue
+                try:
+                    position_data = {
+                        'id': getattr(position, 'id', 'unknown'),
+                        'type': getattr(position, 'position_type', 'unknown'),
+                        'entry_price': float(getattr(position, 'entry_price', 0)),
+                        'shares': float(getattr(position, 'shares', 0)),
+                        'position_value': float(getattr(position, 'position_value', 0)),
+                        'entry_time': getattr(position, 'entry_time', datetime.datetime.now()).isoformat() if isinstance(getattr(position, 'entry_time', None), datetime.datetime) else str(getattr(position, 'entry_time', datetime.datetime.now())),
+                        'target': float(getattr(position, 'target', 0)),
+                        'stop_loss': float(getattr(position, 'stop_loss', 0)),
+                        'exited': bool(getattr(position, 'exited', False)),
+                        'order_filled': bool(getattr(position, 'order_filled', False)),
+                        'pnl': float(getattr(position, 'pnl', 0)),
+                        'status': 'closed' if getattr(position, 'exited', False) else 'active',
+                        'order_id': getattr(position, 'order_id', None)
+                    }
+                    active_positions_data.append(position_data)
+                except Exception as e:
+                    logging.error(f"Error processing active position: {e}")
+                    continue
+
+        all_trade_logs = []
+        for log_entry in trade_log_global:
+            if isinstance(log_entry, dict):
+                timestamp = log_entry.get('timestamp')
+                if isinstance(timestamp, datetime.datetime):
+                    timestamp_str = timestamp.isoformat()
+                else:
+                    timestamp_str = str(timestamp) if timestamp else datetime.datetime.now().isoformat()
+
+                all_trade_logs.append({
+                    'timestamp': timestamp_str,
+                    'message': log_entry.get('message', ''),
+                    'type': log_entry.get('type', 'info'),
+                    'position_id': log_entry.get('position_id'),
+                    'position_type': log_entry.get('position_type'),
+                    'entry_price': log_entry.get('entry_price'),
+                    'exit_price': log_entry.get('exit_price'),
+                    'pnl': log_entry.get('pnl'),
+                    'exit_reason': log_entry.get('exit_reason'),
+                    'trading_mode': log_entry.get('trading_mode', 'REAL' if REAL_TRADING_MODE else 'PAPER')
+                })
+            else:
+                all_trade_logs.append({
+                    'timestamp': datetime.datetime.now().isoformat(),
+                    'message': str(log_entry),
+                    'type': 'info',
+                    'trading_mode': 'REAL' if REAL_TRADING_MODE else 'PAPER'
+                })
+
+        closed_summary = []
+        for pos in closed_positions_list[-50:]:
+            try:
+                entry_time = pos.get('entry_time')
+                exit_time = pos.get('exit_time')
+
+                if isinstance(entry_time, datetime.datetime):
+                    entry_time_str = entry_time.isoformat()
+                else:
+                    entry_time_str = str(entry_time) if entry_time else datetime.datetime.now().isoformat()
+
+                if isinstance(exit_time, datetime.datetime):
+                    exit_time_str = exit_time.isoformat()
+                else:
+                    exit_time_str = str(exit_time) if exit_time else datetime.datetime.now().isoformat()
+
+                closed_summary.append({
+                    'type': pos.get('type', 'unknown'),
+                    'entry_price': pos.get('entry_price', 0),
+                    'exit_price': pos.get('exit_price', 0),
+                    'pnl': pos.get('pnl', 0),
+                    'exit_reason': pos.get('exit_reason', 'unknown'),
+                    'entry_time': entry_time_str,
+                    'exit_time': exit_time_str
+                })
+            except Exception as e:
+                logging.error(f"Error processing closed position: {e}")
+                continue
+
+        current_status_data = {
+            'signal': latest_signal_data.get('signal', 0),
+            'signal_type': 'LONG' if latest_signal_data.get('signal') == 1 else 'SHORT' if latest_signal_data.get('signal') == 2 else 'NEUTRAL',
+            'confidence': latest_signal_data.get('confidence', 0.0),
+            'reason': latest_signal_data.get('reason', 'No signal'),
+            'lstm_signal': latest_signal_data.get('lstm_signal', 0),
+            'lstm_confidence': latest_signal_data.get('lstm_confidence', 0.0),
+            'cnn_signal': latest_signal_data.get('cnn_signal', 0),
+            'cnn_confidence': latest_signal_data.get('cnn_confidence', 0.0),
+            'cnn_pattern': latest_signal_data.get('pattern', 'NO_PATTERN'),
+            'sarimax_signal': latest_signal_data.get('sarimax_signal', 0),
+            'sarimax_confidence': latest_signal_data.get('sarimax_confidence', 0.0),
+            'consensus_achieved': latest_signal_data.get('consensus_achieved', False),
+            'current_price': latest_signal_data.get('current_price', last_price),
+            'rsi': latest_signal_data.get('rsi', 0.0),
+            'bb_position': latest_signal_data.get('bb_position', 0.0),
+            'volume_ratio': latest_signal_data.get('volume_ratio', 0.0),
+            'macd_hist': latest_signal_data.get('macd_hist', 0.0),
+            'valid_signals_count': latest_signal_data.get('valid_signals_count', 0),
+            'agreeing_models': latest_signal_data.get('agreeing_models', 0)
+        }
+
+        response_data = {
+            'success': True,
+            'timestamp': datetime.datetime.now().isoformat(),
+            'trading_mode': 'REAL' if REAL_TRADING_MODE else 'PAPER',
+            'order_status': order_status,
+
+            'current_status': current_status,
+            'signal_data': current_status_data,
+
+            'balance': {
+                'current': float(current_balance),
+                'initial': float(initial_balance),
+                'total_pnl': float(total_pnl),
+                'total_fees': float(total_fees)
+            },
+            'last_price': float(last_price) if last_price else None,
+            'last_trade_time': last_trade_time.isoformat() if last_trade_time else None,
+
+            'active_positions': active_positions_data,
+            'active_positions_count': len(active_positions_data),
+            'closed_positions': closed_summary,
+            'closed_positions_count': len(closed_positions_list),
+
+            'trade_logs': all_trade_logs,
+            'logs_count': len(all_trade_logs),
+
+            'max_positions': max_positions,
+            'position_size_pct': POSITION_SIZE_PCT,
+            'min_position_size': MIN_POSITION_SIZE
+        }
+
+        logging.info(f"API Response - Active: {len(active_positions_data)}, Logs: {len(all_trade_logs)}, Closed: {len(closed_summary)}")
+        return jsonify(response_data)
+
+    except Exception as e:
+        logging.error(f"Error in serve_trade_logs: {str(e)}")
+        import traceback
+        logging.error(traceback.format_exc())
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'timestamp': datetime.datetime.now().isoformat()
+        }), 500
+
+@app.route('/toggle_trading_mode', methods=['POST'])
+@cross_origin()
+def toggle_trading_mode():
+    global REAL_TRADING_MODE
+
+    data = request.get_json()
+    if data and 'real_trading' in data:
+        REAL_TRADING_MODE = bool(data['real_trading'])
+        mode = "REAL" if REAL_TRADING_MODE else "PAPER"
+        logging.info(f"Trading mode changed to: {mode}")
+
+        return jsonify({
+            'success': True,
+            'message': f'Trading mode set to {mode}',
+            'real_trading': REAL_TRADING_MODE
+        })
+
+    return jsonify({
+        'success': False,
+        'error': 'Invalid request. Provide "real_trading" boolean parameter.'
+    }), 400
+
+@app.route('/trading_mode', methods=['GET'])
+@cross_origin()
+def get_trading_mode():
+    return jsonify({
+        'success': True,
+        'real_trading': REAL_TRADING_MODE,
+        'mode': 'REAL' if REAL_TRADING_MODE else 'PAPER'
+    })
+
+if __name__ == '__main__':
+    mode = "REAL" if REAL_TRADING_MODE else "PAPER"
+    logging.info("Initializing FLEXIBLE-CONSENSUS BIO Trading Bot...")
+    logging.info("=" * 80)
+    logging.info(f"TRADING MODE: {mode}")
+    logging.info("CAPITAL UTILIZATION (FIXED):")
+    logging.info(f"- Position Size: {POSITION_SIZE_PCT*100:.0f}% of balance per trade")
+    logging.info(f"- Leverage: {LEVERAGE}x")
+    logging.info(f"- Min Position Size: {MIN_POSITION_SIZE} BIO (no artificial floor)")
+    logging.info(f"Max Positions: {max_positions}")
+    logging.info(f"Target: 1% | Stop Loss: 4%")
+    logging.info("=" * 80)
+
+    load_models(model='LSTM')
+    load_models(model='CNN')
+    load_models(model='SARIMAX')
+
+    logging.info(f"Models loaded status: {models_loaded}")
+    logging.info(f"LSTM model: {lstm_model is not None}")
+    logging.info(f"CNN model: {cnn_model is not None}")
+
+    initial_data = fetch_initial_data()
+    if initial_data is not None and len(initial_data) > 0:
+        full_data = initial_data.to_dict('records')
+        initialize_scalers(initial_data)
+        logging.info(f"Initialized scalers with {len(full_data)} data points")
+        logging.info(f"CULR scaler loaded: {culr_scaler is not None}")
+    else:
+        logging.warning("Using minimal dummy data for initialization")
+        dummy_data = []
+        base_price = 0.04
+        for i in range(INITIAL_DATA_POINTS):
+            dummy_data.append({
+                'open': base_price, 'high': base_price * 1.01, 'low': base_price * 0.99,
+                'close': base_price, 'volume': 1000, 'time': datetime.datetime.now() - timedelta(minutes=i)
+            })
+        full_data = dummy_data
+
+    threading.Thread(
+        target=lambda: app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False),
+        daemon=True
+    ).start()
+
+    logging.info("Flask server started on port 5000")
+
+    if REAL_TRADING_MODE:
+        threading.Thread(
+            target=order_and_balance_update,
+            daemon=True
+        ).start()
+
+    websocket_thread = threading.Thread(
+        target=start_websocket,
+        daemon=True
+    )
+    websocket_thread.start()
+
+    logging.info("Starting WebSocket connection...")
+
+    try:
+        while True:
+            time.sleep(1)
+
+            if last_price and len(active_positions) > 0:
+                check_positions(last_price)
+
+            with position_lock:
+                for position in active_positions:
+                    if not position.order_filled and (datetime.datetime.now() - position.entry_time) > timedelta(seconds=30):
+                        logging.warning(f"Position {position.id} order pending for too long, forcing to filled")
+                        position.order_filled = True
+
+    except KeyboardInterrupt:
+        logging.info("Flexible-Consensus Trading Bot stopped by user")
+        sys.exit(0)
