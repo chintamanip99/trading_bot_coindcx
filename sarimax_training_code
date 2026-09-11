@@ -1,0 +1,380 @@
+import numpy as np
+import pandas as pd
+import datetime
+import requests
+import matplotlib.pyplot as plt
+import talib
+from sklearn.preprocessing import RobustScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.stats.diagnostic import acorr_ljungbox
+from statsmodels.tsa.seasonal import seasonal_decompose
+import warnings
+warnings.filterwarnings('ignore')
+
+# Constants
+LOOKBACK = 60
+TARGET_LOOKAHEAD = 1
+EMA_PERIOD = 2
+ALPHA = 2 / (EMA_PERIOD + 1)
+
+def fetch_historical_data():
+    end_time = int(pd.Timestamp.now().timestamp()*1000)
+    start_time = int((pd.Timestamp.now()-pd.Timedelta(days=365)).timestamp()*1000)
+    url = f"https://public.coindcx.com/market_data/candles?pair=B-LAB_USDT&interval=15m&startTime={start_time}&endTime={end_time}"
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+    data = response.json()
+
+    # Convert list of dicts to list of lists
+    formatted_data = [
+        [d["time"], d["open"], d["high"], d["low"], d["close"], d["volume"], 0]
+        for d in data
+    ]
+    return formatted_data
+
+def preprocess_data(data):
+    """Process raw API data into structured DataFrame with new features"""
+    columns = ['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI']
+    df = pd.DataFrame(data, columns=columns)
+    
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df.set_index('timestamp', inplace=True)
+    
+    # Basic transformations
+    df['log_close'] = np.log(df['Close'])
+    df['close_diff'] = df['Close'].diff()
+    
+    # Momentum indicators
+    df['rsi'] = talib.RSI(df['Close'], timeperiod=14)
+    df['mom'] = talib.MOM(df['Close'], timeperiod=10)
+    
+    # EMA indicators
+    df['ema_5'] = talib.EMA(df['Close'], timeperiod=5)
+    df['ema_10'] = talib.EMA(df['Close'], timeperiod=10)
+    df['ema_20'] = talib.EMA(df['Close'], timeperiod=20)
+    df['ema_50'] = talib.EMA(df['Close'], timeperiod=50)
+    
+    # Price to EMA ratios
+    df['close_ema_5_ratio'] = df['Close'] / df['ema_5']
+    df['close_ema_10_ratio'] = df['Close'] / df['ema_10']
+    df['close_ema_20_ratio'] = df['Close'] / df['ema_20']
+    df['close_ema_50_ratio'] = df['Close'] / df['ema_50']
+    
+    # Rate of Change indicators
+    df['roc_5'] = talib.ROC(df['Close'], timeperiod=5)
+    df['roc_10'] = talib.ROC(df['Close'], timeperiod=10)
+    df['roc_15'] = talib.ROC(df['Close'], timeperiod=15)
+    
+    # Volatility indicators (standard deviation of returns)
+    df['returns'] = df['Close'].pct_change()
+    df['volatility_10'] = df['returns'].rolling(10).std()
+    df['volatility_20'] = df['returns'].rolling(20).std()
+    
+    # Target calculation (EMA in future periods)
+    df['Next_Close'] = df['Close'].shift(-TARGET_LOOKAHEAD)
+    df['ema'] = talib.EMA(df['Next_Close'], timeperiod=EMA_PERIOD)
+    
+    # Clean data
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df.dropna(inplace=True)
+    
+    return df
+
+def prepare_sarimax_data(df):
+    """Prepare data for SARIMAX model with same features as LSTM"""
+    features = [
+        'log_close', 'close_diff', 'rsi', 'mom',
+        'ema_5', 'ema_10', 'ema_20', 'ema_50',
+        'close_ema_5_ratio', 'close_ema_10_ratio',
+        'close_ema_20_ratio', 'close_ema_50_ratio',
+        'roc_5', 'roc_10', 'roc_15',
+        'volatility_10', 'volatility_20'
+    ]
+    
+    # Calculate target (future EMA difference)
+    ema_shifted = df['ema'].shift(-TARGET_LOOKAHEAD)
+    valid_indices = ~ema_shifted.isna()
+    predicted_diff = (ema_shifted[valid_indices] - df['ema'][valid_indices]) / ALPHA
+    
+    # Align features with target
+    df_aligned = df[valid_indices].copy()
+    df_aligned['target'] = predicted_diff
+    
+    # Scale features for better SARIMAX performance
+    scaler_x = RobustScaler()
+    scaler_y = RobustScaler()
+    
+    # Scale exogenous variables
+    exog_scaled = scaler_x.fit_transform(df_aligned[features])
+    exog_df = pd.DataFrame(exog_scaled, columns=features, index=df_aligned.index)
+    
+    # Scale target
+    target_scaled = scaler_y.fit_transform(df_aligned['target'].values.reshape(-1, 1)).flatten()
+    target_series = pd.Series(target_scaled, index=df_aligned.index)
+    
+    return target_series, exog_df, df_aligned, scaler_x, scaler_y
+
+def find_optimal_sarimax_params(y_train, exog_train, max_p=3, max_d=2, max_q=3):
+    """Quick parameter search for SARIMAX - optimized for speed"""
+    best_aic = float('inf')
+    best_params = None
+    
+    # Limited search space for speed
+    param_combinations = [
+        (1, 1, 1), (1, 1, 0), (0, 1, 1), (2, 1, 1), 
+        (1, 1, 2), (2, 1, 0), (0, 1, 2), (1, 0, 1)
+    ]
+    
+    for p, d, q in param_combinations:
+        try:
+            model = SARIMAX(y_train, exog=exog_train, order=(p, d, q), 
+                          seasonal_order=(0, 0, 0, 0), enforce_stationarity=False,
+                          enforce_invertibility=False, initialization='approximate_diffuse')
+            fitted_model = model.fit(disp=False, maxiter=50)  # Reduced iterations for speed
+            
+            if fitted_model.aic < best_aic:
+                best_aic = fitted_model.aic
+                best_params = (p, d, q)
+        except:
+            continue
+    
+    return best_params if best_params else (1, 1, 1)
+
+def build_sarimax_model(y_train, exog_train):
+    """Build and fit SARIMAX model quickly"""
+    # Find optimal parameters (quick search)
+    optimal_params = find_optimal_sarimax_params(y_train, exog_train)
+    print(f"Optimal SARIMAX parameters: {optimal_params}")
+    
+    # Fit final model
+    model = SARIMAX(y_train, exog=exog_train, order=optimal_params,
+                   seasonal_order=(0, 0, 0, 0), enforce_stationarity=False,
+                   enforce_invertibility=False, initialization='approximate_diffuse')
+    
+    fitted_model = model.fit(disp=False, maxiter=100)
+    return fitted_model
+
+def calculate_metrics(actual, predicted, title):
+    """Calculate and print evaluation metrics"""
+    print(f"\n{title} Metrics:")
+    mae = mean_absolute_error(actual, predicted)
+    rmse = np.sqrt(mean_squared_error(actual, predicted))
+    r2 = r2_score(actual, predicted)
+    
+    print(f"MAE: {mae:.6f}")
+    print(f"RMSE: {rmse:.6f}")
+    print(f"R2: {r2:.6f}")
+    
+    # Direction accuracy
+    if len(actual) > 1:
+        direction_correct = np.sign(actual[1:] - actual[:-1]) == np.sign(predicted[1:] - predicted[:-1])
+        direction_acc = np.mean(direction_correct)
+        print(f"Direction Accuracy: {direction_acc:.4f}")
+    
+    return mae, r2
+
+def plot_results(df, y_true, y_pred, title):
+    """Visualize predictions vs actuals"""
+    plt.figure(figsize=(14, 6))
+    plt.plot(range(len(y_true)), y_true, label='Actual EMA Future', linewidth=2)
+    plt.plot(range(len(y_pred)), y_pred, label='Predicted EMA Future', alpha=0.8, linewidth=2)
+    plt.title(title)
+    plt.xlabel('Time Steps')
+    plt.ylabel('EMA Value')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.show()
+
+def plot_residuals(residuals, title):
+    """Plot residual analysis"""
+    fig, axes = plt.subplots(2, 2, figsize=(15, 8))
+    
+    # Residuals over time
+    axes[0, 0].plot(residuals)
+    axes[0, 0].set_title('Residuals over Time')
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # Histogram of residuals
+    axes[0, 1].hist(residuals, bins=30, alpha=0.7)
+    axes[0, 1].set_title('Distribution of Residuals')
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # Q-Q plot
+    from scipy import stats
+    stats.probplot(residuals, dist="norm", plot=axes[1, 0])
+    axes[1, 0].set_title('Q-Q Plot')
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # ACF of residuals
+    from statsmodels.tsa.stattools import acf
+    try:
+        autocorr = acf(residuals, nlags=20, fft=True)
+        axes[1, 1].stem(range(len(autocorr)), autocorr)
+        axes[1, 1].set_title('Autocorrelation of Residuals')
+        axes[1, 1].grid(True, alpha=0.3)
+    except:
+        axes[1, 1].text(0.5, 0.5, 'ACF calculation failed', ha='center', va='center')
+    
+    plt.suptitle(title)
+    plt.tight_layout()
+    plt.show()
+
+def main():
+    print("Starting SARIMAX Trading Model...")
+    
+    # Data pipeline
+    try:
+        print("Fetching and preprocessing data...")
+        raw_data = fetch_historical_data()
+        df = preprocess_data(raw_data)
+        target_series, exog_df, df_aligned, scaler_x, scaler_y = prepare_sarimax_data(df)
+        print(f"Data shape: {exog_df.shape}, Target shape: {target_series.shape}")
+    except Exception as e:
+        print(f"Error in data pipeline: {e}")
+        return
+
+    # Train-test split
+    split_index = int(0.8 * len(target_series))
+    
+    y_train = target_series[:split_index]
+    y_test = target_series[split_index:]
+    exog_train = exog_df[:split_index]
+    exog_test = exog_df[split_index:]
+    
+    print(f"Training samples: {len(y_train)}, Test samples: {len(y_test)}")
+
+    # Model training
+    try:
+        print("Training SARIMAX model...")
+        fitted_model = build_sarimax_model(y_train, exog_train)
+        print("Model training completed!")
+        
+        # Model summary
+        print("\nModel Summary:")
+        print(f"AIC: {fitted_model.aic:.2f}")
+        print(f"BIC: {fitted_model.bic:.2f}")
+        
+    except Exception as e:
+        print(f"Error during model training: {e}")
+        return
+    
+    # Predictions
+    try:
+        print("Making predictions...")
+        
+        # In-sample predictions (training)
+        y_train_pred = fitted_model.fittedvalues
+        
+        # Out-of-sample predictions (testing)
+        y_test_pred = fitted_model.forecast(steps=len(y_test), exog=exog_test)
+        
+        print("Predictions completed!")
+        
+    except Exception as e:
+        print(f"Error during prediction: {e}")
+        return
+    
+    # Inverse scaling for target
+    y_train_pred_inv = scaler_y.inverse_transform(y_train_pred.values.reshape(-1, 1)).flatten()
+    y_test_pred_inv = scaler_y.inverse_transform(y_test_pred.values.reshape(-1, 1)).flatten()
+    y_train_true_scaled = y_train.values
+    y_test_true_scaled = y_test.values
+    y_train_true_inv = scaler_y.inverse_transform(y_train_true_scaled.reshape(-1, 1)).flatten()
+    y_test_true_inv = scaler_y.inverse_transform(y_test_true_scaled.reshape(-1, 1)).flatten()
+    
+    # Get base EMA values
+    base_ema_train = df_aligned['ema'].iloc[:len(y_train_pred_inv)].values
+    base_ema_test = df_aligned['ema'].iloc[len(y_train_pred_inv):len(y_train_pred_inv)+len(y_test_pred_inv)].values
+    
+    # Reconstruct future EMA
+    y_train_recon = base_ema_train + (ALPHA * y_train_pred_inv)
+    y_test_recon = base_ema_test + (ALPHA * y_test_pred_inv)
+    
+    # Get true future EMA values
+    y_train_true_recon = base_ema_train + (ALPHA * y_train_true_inv)
+    y_test_true_recon = base_ema_test + (ALPHA * y_test_true_inv)
+    
+    # Calculate metrics
+    train_mae, train_r2 = calculate_metrics(y_train_true_recon, y_train_recon, "Train")
+    test_mae, test_r2 = calculate_metrics(y_test_true_recon, y_test_recon, "Test")
+    
+    print(f"\nFinal R² Scores - Train: {train_r2:.6f}, Test: {test_r2:.6f}")
+    
+    # Visualizations
+    if len(y_test_true_recon) > 0:
+        plot_results(df_aligned, y_test_true_recon, y_test_recon, 'Test Set - SARIMAX EMA Future Prediction')
+        
+        # Plot residuals
+        test_residuals = y_test_true_recon - y_test_recon
+        plot_residuals(test_residuals, 'SARIMAX Model Residual Analysis')
+        
+        # Model diagnostics
+        print("\nModel Diagnostics:")
+        try:
+            # Ljung-Box test for residual autocorrelation
+            lb_stat, lb_pvalue = acorr_ljungbox(fitted_model.resid, lags=10, return_df=False)
+            print(f"Ljung-Box test p-value: {lb_pvalue[-1]:.6f}")
+            print("Residuals are", "independent" if lb_pvalue[-1] > 0.05 else "autocorrelated")
+        except:
+            print("Ljung-Box test failed")
+    
+    # Save results and update server
+    try:
+        # Save model results to file
+        results = {
+            'train_mae': train_mae,
+            'test_mae': test_mae,
+            'train_r2': train_r2,
+            'test_r2': test_r2,
+            'model_params': fitted_model.model.order,
+            'aic': fitted_model.aic,
+            'bic': fitted_model.bic
+        }
+        
+        pd.Series(results).to_json('sarimax_results.json')
+        print("Results saved to sarimax_results.json")
+        
+        # Update server
+        requests.post("http://localhost:5000/update", json={"Updated": "SARIMAX"})
+        requests.post("http://localhost:5000/update", json={"SARIMAX": test_mae})
+        requests.post("http://localhost:5000/update", json={"SARIMAX_R2": test_r2})
+        print("Server updated successfully")
+        
+    except Exception as e:
+        print(f"Warning: Could not update server: {e}")
+    
+    return fitted_model, test_r2
+
+if __name__ == "__main__":
+    print("SARIMAX Trading Model - Optimized for Speed and High R²")
+    print("=" * 60)
+    
+    while True:
+        try:
+            model, r2_score, dir_acc = main()
+            print(f"\nModel completed with R² = {r2_score:.6f}, Direction Acc = {dir_acc:.4f}")
+            model.save('sarimax_model_coindcx_optimized.h5')
+            # Check targets
+            if r2_score > 0.9 and dir_acc >= 0.70:
+                print("🎉 Both R² > 0.9 AND Direction Accuracy ≥ 70% achieved!")
+            elif dir_acc >= 0.70:
+                print(f"👍 Direction Accuracy target achieved: {dir_acc:.1%}")
+            elif r2_score > 0.9:
+                print(f"👍 R² target achieved: {r2_score:.1%}")
+            else:
+                print(f"🔄 Targets - R²: {r2_score:.1%} (need >90%), Dir Acc: {dir_acc:.1%} (need ≥70%)")
+            
+            # Wait before next iteration
+            print("\nWaiting 30 seconds before next iteration...")
+            import time
+            # time.sleep(30)
+            
+        except KeyboardInterrupt:
+            print("\nModel stopped by user")
+            break
+        except Exception as e:
+            print(f"Error in main loop: {e}")
+            print("Retrying in 60 seconds...")
+            import time
+            # time.sleep(60)#workingcode2
