@@ -1,0 +1,482 @@
+import numpy as np
+import pandas as pd
+import requests
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler, LabelEncoder
+from sklearn.metrics import classification_report, confusion_matrix
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout, BatchNormalization
+from tensorflow.keras.optimizers import Adam
+from pyts.image import GramianAngularField
+from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping
+from imblearn.over_sampling import SMOTE, RandomOverSampler
+import talib
+import joblib
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Parameters
+WINDOW_SIZE = 60
+BATCH_SIZE = 16
+EPOCHS = 20
+LEARNING_RATE = 0.001
+
+CANDLE_PATTERNS = [
+    'CDLDOJI', 'CDLHAMMER', 'CDLINVERTEDHAMMER', 'CDLENGULFING', 'CDLSHOOTINGSTAR',
+    'CDLMORNINGSTAR', 'CDLEVENINGSTAR', 'CDLHANGINGMAN', 'CDLBELTHOLD', 'CDLPIERCING',
+    'CDLHARAMI', 'CDL3WHITESOLDIERS', 'CDL3BLACKCROWS', 'CDLMARUBOZU', 'CDLSPINNINGTOP',
+    'CDLDRAGONFLYDOJI', 'CDLGRAVESTONEDOJI', 'CDLTAKURI', 'CDL3INSIDE', 'CDL3OUTSIDE'
+]
+
+# --- Feature Engineering ---
+def clean_data(df):
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df.fillna(method='ffill', inplace=True)
+    df.fillna(method='bfill', inplace=True)
+    df.fillna(0, inplace=True)
+    return df
+
+def detect_candle_patterns(df):
+    """Detect all candlestick patterns using talib"""
+    pattern_results = {}
+    
+    for pattern in CANDLE_PATTERNS:
+        pattern_func = getattr(talib, pattern)
+        pattern_results[pattern] = pattern_func(df['open'], df['high'], df['low'], df['close'])
+    
+    return pattern_results
+
+def create_pattern_labels(pattern_results):
+    """UPDATED: Create labels with proper directional pattern handling"""
+    labels = []
+    pattern_names = list(CANDLE_PATTERNS)
+    
+    # Create DataFrame from pattern results
+    pattern_df = pd.DataFrame(pattern_results)
+    
+    for idx in range(len(pattern_df)):
+        row = pattern_df.iloc[idx]
+        
+        # Find patterns detected at this candle with directional handling
+        detected_patterns = []
+        
+        for pattern in pattern_names:
+            pattern_value = row[pattern]
+            
+            if pattern_value != 0:
+                # Handle directional patterns
+                if pattern == 'CDLBELTHOLD':
+                    if pattern_value > 0:
+                        detected_patterns.append('CDLBELTHOLD_BULL')
+                    elif pattern_value < 0:
+                        detected_patterns.append('CDLBELTHOLD_BEAR')
+                elif pattern == 'CDLENGULFING':
+                    if pattern_value > 0:
+                        detected_patterns.append('CDLENGULFING_BULL')
+                    elif pattern_value < 0:
+                        detected_patterns.append('CDLENGULFING_BEAR')
+                elif pattern == 'CDLHARAMI':
+                    if pattern_value > 0:
+                        detected_patterns.append('CDLHARAMI_BULL')
+                    elif pattern_value < 0:
+                        detected_patterns.append('CDLHARAMI_BEAR')
+                else:
+                    # Non-directional patterns - keep as is
+                    detected_patterns.append(pattern)
+        
+        if len(detected_patterns) == 0:
+            labels.append('NO_PATTERN')
+        elif len(detected_patterns) == 1:
+            labels.append(detected_patterns[0])
+        else:
+            # UPDATED: Priority system including directional patterns
+            priority_order = [
+                'CDLMORNINGSTAR', 'CDLEVENINGSTAR', 'CDL3WHITESOLDIERS', 'CDL3BLACKCROWS',
+                'CDLENGULFING_BULL', 'CDLENGULFING_BEAR', 'CDLHAMMER', 'CDLINVERTEDHAMMER', 
+                'CDLSHOOTINGSTAR', 'CDLDOJI', 'CDLDRAGONFLYDOJI', 'CDLGRAVESTONEDOJI', 
+                'CDLMARUBOZU', 'CDLPIERCING', 'CDLHARAMI_BULL', 'CDLHARAMI_BEAR',
+                'CDLBELTHOLD_BULL', 'CDLBELTHOLD_BEAR', 'CDLHANGINGMAN',
+                'CDLSPINNINGTOP', 'CDLTAKURI', 'CDL3INSIDE', 'CDL3OUTSIDE'
+            ]
+            
+            for priority_pattern in priority_order:
+                if priority_pattern in detected_patterns:
+                    labels.append(priority_pattern)
+                    break
+    
+    return labels
+
+def fetch_and_preprocess_data():
+    """Fetch data and preprocess for pattern classification"""
+    end_time = int(datetime.now().timestamp() * 1000)
+    start_time = int((datetime.now() - timedelta(days=365)).timestamp() * 1000)
+    url = f"https://public.coindcx.com/market_data/candles?pair=B-LAB_USDT&interval=1m&startTime={start_time}&endTime={end_time}"
+    
+    response = requests.get(url)
+    data = response.json()
+    btc_data = pd.DataFrame(data)
+    
+    # Check what columns we actually have
+    print("Available columns:", btc_data.columns.tolist())
+    
+    # Use the actual column names from the API response
+    # The columns are likely: ['open', 'high', 'low', 'close', 'volume', 'time']
+    btc_data[['open', 'high', 'low', 'close', 'volume']] = btc_data[['open', 'high', 'low', 'close', 'volume']].astype(float)
+    btc_data = clean_data(btc_data)
+
+    # Detect candlestick patterns with directional handling
+    print("Detecting candlestick patterns with directional classification...")
+    pattern_results = detect_candle_patterns(btc_data)
+    pattern_labels = create_pattern_labels(pattern_results)
+    btc_data['pattern_label'] = pattern_labels
+
+    # Log pattern distribution
+    print("\nDetected Pattern Distribution:")
+    pattern_dist = pd.Series(pattern_labels).value_counts()
+    for pattern, count in pattern_dist.items():
+        print(f"{pattern}: {count}")
+
+    # Basic technical indicators for features
+    btc_data['log_close'] = np.log(btc_data['close'])
+    btc_data['close_diff'] = btc_data['close'].diff()
+    btc_data['price_range'] = btc_data['high'] - btc_data['low']
+    btc_data['body_size'] = abs(btc_data['close'] - btc_data['open'])
+    btc_data['upper_shadow'] = btc_data['high'] - np.maximum(btc_data['open'], btc_data['close'])
+    btc_data['lower_shadow'] = np.minimum(btc_data['open'], btc_data['close']) - btc_data['low']
+    
+    # Momentum indicators
+    btc_data['rsi'] = talib.RSI(btc_data['close'], timeperiod=14)
+    btc_data['mom'] = talib.MOM(btc_data['close'], timeperiod=10)
+    btc_data['stoch_k'], btc_data['stoch_d'] = talib.STOCH(btc_data['high'], btc_data['low'], btc_data['close'])
+    
+    # Moving averages
+    btc_data['sma_10'] = talib.SMA(btc_data['close'], timeperiod=10)
+    btc_data['sma_20'] = talib.SMA(btc_data['close'], timeperiod=20)
+    btc_data['ema_12'] = talib.EMA(btc_data['close'], timeperiod=12)
+    btc_data['ema_26'] = talib.EMA(btc_data['close'], timeperiod=26)
+    
+    # MACD
+    btc_data['macd'], btc_data['macd_signal'], btc_data['macd_hist'] = talib.MACD(btc_data['close'])
+    
+    # Bollinger Bands
+    btc_data['bb_upper'], btc_data['bb_middle'], btc_data['bb_lower'] = talib.BBANDS(btc_data['close'])
+    btc_data['bb_width'] = btc_data['bb_upper'] - btc_data['bb_lower']
+    btc_data['bb_position'] = (btc_data['close'] - btc_data['bb_lower']) / btc_data['bb_width']
+    
+    # Volume indicators
+    btc_data['volume_sma'] = talib.SMA(btc_data['volume'], timeperiod=20)
+    btc_data['volume_ratio'] = btc_data['volume'] / btc_data['volume_sma']
+    
+    # Volatility
+    btc_data['atr'] = talib.ATR(btc_data['high'], btc_data['low'], btc_data['close'], timeperiod=14)
+    btc_data['returns'] = btc_data['close'].pct_change()
+    btc_data['volatility'] = btc_data['returns'].rolling(20).std()
+    
+    btc_data = clean_data(btc_data)
+    
+    features = [
+        'log_close', 'close_diff', 'price_range', 'body_size', 'upper_shadow', 'lower_shadow',
+        'rsi', 'mom', 'stoch_k', 'stoch_d', 'sma_10', 'sma_20', 'ema_12', 'ema_26',
+        'macd', 'macd_signal', 'macd_hist', 'bb_upper', 'bb_middle', 'bb_lower',
+        'bb_width', 'bb_position', 'volume_ratio', 'atr', 'volatility'
+    ]
+    
+    # Remove rows with NaN values
+    btc_data.dropna(inplace=True)
+    
+    # Scale features
+    scaler = MinMaxScaler(feature_range=(-1, 1))
+    btc_data[features] = scaler.fit_transform(btc_data[features])
+    joblib.dump(scaler, 'pattern_feature_scaler.pkl')
+    
+    return btc_data, features
+
+def create_gaf_images(data, columns, window_size):
+    """Create Gramian Angular Field images from time series data"""
+    gaf = GramianAngularField(method='summation', image_size=window_size)
+    gaf_images = []
+    labels = []
+    
+    for i in range(window_size, len(data)):
+        window_data = data.iloc[i-window_size:i][columns].values.T.astype(np.float64)
+        gaf_image = gaf.fit_transform(window_data)
+        gaf_images.append(gaf_image)
+        labels.append(data.iloc[i]['pattern_label'])
+    
+    return np.array(gaf_images), labels
+
+def create_cnn_model(input_shape, num_classes):
+    """UPDATED: Create CNN model for directional pattern classification"""
+    model = Sequential([
+        Conv2D(32, (3, 3), activation='relu', padding='same', input_shape=input_shape),
+        BatchNormalization(),
+        MaxPooling2D(pool_size=(2, 2)),
+        Dropout(0.2),
+        
+        Conv2D(64, (3, 3), activation='relu', padding='same'),
+        BatchNormalization(),
+        MaxPooling2D(pool_size=(2, 2)),
+        Dropout(0.2),
+        
+        Conv2D(128, (3, 3), activation='relu', padding='same'),
+        BatchNormalization(),
+        MaxPooling2D(pool_size=(2, 2)),
+        Dropout(0.3),
+        
+        # Additional layer for better directional pattern discrimination
+        Conv2D(256, (3, 3), activation='relu', padding='same'),
+        BatchNormalization(),
+        MaxPooling2D(pool_size=(2, 2)),
+        Dropout(0.3),
+        
+        Flatten(),
+        Dense(512, activation='relu'),  # Increased capacity
+        Dropout(0.4),
+        Dense(256, activation='relu'),
+        Dropout(0.3),
+        Dense(128, activation='relu'),
+        Dropout(0.3),
+        Dense(num_classes, activation='softmax')
+    ])
+    
+    model.compile(
+        optimizer=Adam(learning_rate=LEARNING_RATE),
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+    
+    return model
+
+def plot_pattern_distribution(labels, title="Pattern Distribution"):
+    """Plot distribution of candlestick patterns including directional ones"""
+    plt.figure(figsize=(18, 10))  # Increased size for more patterns
+    pattern_counts = pd.Series(labels).value_counts()
+    
+    plt.subplot(1, 2, 1)
+    pattern_counts.plot(kind='bar')
+    plt.title(f'{title} - Bar Chart')
+    plt.xticks(rotation=45, ha='right')
+    plt.tight_layout()
+    
+    plt.subplot(1, 2, 2)
+    # Only show top patterns in pie chart to avoid clutter
+    top_patterns = pattern_counts.head(10)
+    other_count = pattern_counts[10:].sum() if len(pattern_counts) > 10 else 0
+    if other_count > 0:
+        top_patterns = pd.concat([top_patterns, pd.Series([other_count], index=['Others'])])
+    
+    top_patterns.plot(kind='pie', autopct='%1.1f%%')
+    plt.title(f'{title} - Top 10 Patterns')
+    plt.tight_layout()
+    
+    plt.show()
+    return pattern_counts
+
+def handle_class_imbalance(X, y, label_encoder):
+    """Handle class imbalance with appropriate strategy for directional patterns"""
+    # Check class distribution
+    class_counts = np.bincount(y)
+    min_samples = np.min(class_counts[class_counts > 0])
+    
+    print(f"Minimum class samples: {min_samples}")
+    print(f"Class distribution: {dict(zip(label_encoder.classes_, class_counts))}")
+    
+    # For classes with very few samples, use RandomOverSampler
+    if min_samples < 5:  # If any class has fewer than 5 samples
+        print("Using RandomOverSampler due to classes with very few samples")
+        ros = RandomOverSampler(random_state=42)
+        X_reshaped = X.reshape(X.shape[0], -1)
+        X_resampled, y_resampled = ros.fit_resample(X_reshaped, y)
+        X_resampled = X_resampled.reshape(-1, X.shape[1], X.shape[2], X.shape[3])
+    else:
+        # Use SMOTE with adaptive k_neighbors
+        k_neighbors = min(3, min_samples - 1)  # Ensure k_neighbors is valid
+        print(f"Using SMOTE with k_neighbors={k_neighbors}")
+        smote = SMOTE(random_state=42, k_neighbors=k_neighbors)
+        X_reshaped = X.reshape(X.shape[0], -1)
+        X_resampled, y_resampled = smote.fit_resample(X_reshaped, y)
+        X_resampled = X_resampled.reshape(-1, X.shape[1], X.shape[2], X.shape[3])
+    
+    return X_resampled, y_resampled
+
+def validate_directional_patterns(pattern_labels):
+    """Validate that directional patterns are properly detected"""
+    pattern_counts = pd.Series(pattern_labels).value_counts()
+    
+    print("\n=== DIRECTIONAL PATTERN VALIDATION ===")
+    directional_patterns = ['CDLBELTHOLD_BULL', 'CDLBELTHOLD_BEAR', 
+                          'CDLENGULFING_BULL', 'CDLENGULFING_BEAR',
+                          'CDLHARAMI_BULL', 'CDLHARAMI_BEAR']
+    
+    for pattern in directional_patterns:
+        count = pattern_counts.get(pattern, 0)
+        print(f"{pattern}: {count} samples")
+    
+    # Check if we have both bull and bear versions
+    bull_bear_pairs = [
+        ('CDLBELTHOLD_BULL', 'CDLBELTHOLD_BEAR'),
+        ('CDLENGULFING_BULL', 'CDLENGULFING_BEAR'),
+        ('CDLHARAMI_BULL', 'CDLHARAMI_BEAR')
+    ]
+    
+    for bull, bear in bull_bear_pairs:
+        bull_count = pattern_counts.get(bull, 0)
+        bear_count = pattern_counts.get(bear, 0)
+        total = bull_count + bear_count
+        if total > 0:
+            bull_pct = (bull_count / total) * 100
+            bear_pct = (bear_count / total) * 100
+            print(f"{bull.replace('_BULL', '')}: Bull {bull_pct:.1f}% | Bear {bear_pct:.1f}%")
+    
+    print("=========================================\n")
+
+def main():
+    print("Fetching and preprocessing data with directional pattern classification...")
+    btc_data, features = fetch_and_preprocess_data()
+    
+    # Shuffle data
+    btc_data = btc_data.sample(frac=1).reset_index(drop=True)
+    
+    print("Creating GAF images...")
+    gaf_images, pattern_labels = create_gaf_images(btc_data, features, WINDOW_SIZE)
+    
+    # Validate directional pattern detection
+    validate_directional_patterns(pattern_labels)
+    
+    # Transpose images for CNN input format
+    X_gaf = np.transpose(gaf_images, (0, 2, 3, 1))
+    
+    # UPDATED: Encode pattern labels including directional patterns
+    label_encoder = LabelEncoder()
+    y_encoded = label_encoder.fit_transform(pattern_labels)
+    
+    # Save label encoder
+    joblib.dump(label_encoder, 'pattern_label_encoder.pkl')
+    
+    print(f"\nTotal unique patterns detected: {len(label_encoder.classes_)}")
+    print("Pattern classes:", label_encoder.classes_)
+    
+    print("\nPattern Distribution (Before Balancing):")
+    pattern_counts_before = plot_pattern_distribution(pattern_labels, "Before Balancing")
+    print(pattern_counts_before)
+    
+    # Handle class imbalance with appropriate strategy
+    print("Balancing classes for directional patterns...")
+    X_resampled, y_resampled = handle_class_imbalance(X_gaf, y_encoded, label_encoder)
+    
+    # Convert back to pattern names for visualization
+    resampled_pattern_names = label_encoder.inverse_transform(y_resampled)
+    print("\nPattern Distribution (After Balancing):")
+    pattern_counts_after = plot_pattern_distribution(resampled_pattern_names, "After Balancing")
+    print(pattern_counts_after)
+    
+    # Split data
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_resampled, y_resampled, test_size=0.2, random_state=42, stratify=y_resampled
+    )
+    
+    print("Creating enhanced CNN model for directional patterns...")
+    num_classes = len(label_encoder.classes_)
+    model = create_cnn_model((WINDOW_SIZE, WINDOW_SIZE, len(features)), num_classes)
+    
+    print(f"Model summary - Input shape: {X_train.shape}, Number of classes: {num_classes}")
+    model.summary()
+    
+    # Callbacks with adjusted patience for more complex model
+    reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=20, min_lr=0.00001, verbose=1)
+    early_stop = EarlyStopping(monitor='val_loss', patience=30, restore_best_weights=True, verbose=1)
+    
+    print("Training enhanced model with directional pattern classification...")
+    history = model.fit(
+        X_train, y_train,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        validation_data=(X_val, y_val),
+        callbacks=[reduce_lr, early_stop],
+        verbose=1
+    )
+    
+    # Evaluate model
+    print("Evaluating model...")
+    y_pred = model.predict(X_val)
+    model.save('sarimax_model_coindcx_optimized.h5')
+    y_pred_classes = np.argmax(y_pred, axis=1)
+    
+    # Classification report
+    target_names = label_encoder.classes_
+    print("\nClassification Report (Including Directional Patterns):")
+    print(classification_report(y_val, y_pred_classes, target_names=target_names, zero_division=0))
+    
+    # Enhanced confusion matrix for directional patterns
+    cm = confusion_matrix(y_val, y_pred_classes)
+    plt.figure(figsize=(16, 12))  # Larger size for more classes
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=target_names, yticklabels=target_names)
+    plt.title('Confusion Matrix - Directional Candlestick Pattern Classification')
+    plt.ylabel('True Pattern')
+    plt.xlabel('Predicted Pattern')
+    plt.xticks(rotation=45, ha='right')
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    plt.show()
+    
+    # Analyze directional pattern performance
+    print("\n=== DIRECTIONAL PATTERN PERFORMANCE ===")
+    directional_patterns = ['CDLBELTHOLD_BULL', 'CDLBELTHOLD_BEAR', 
+                          'CDLENGULFING_BULL', 'CDLENGULFING_BEAR',
+                          'CDLHARAMI_BULL', 'CDLHARAMI_BEAR']
+    
+    for pattern in directional_patterns:
+        if pattern in target_names:
+            pattern_idx = list(target_names).index(pattern)
+            pattern_mask = y_val == pattern_idx
+            if pattern_mask.sum() > 0:
+                pattern_accuracy = (y_pred_classes[pattern_mask] == y_val[pattern_mask]).mean()
+                print(f"{pattern}: {pattern_accuracy:.3f} accuracy ({pattern_mask.sum()} samples)")
+    
+    # Save model and encoders
+    model.save('candlestick_pattern_classifier.h5')
+    print("\nModel saved as 'candlestick_pattern_classifier.h5'")
+    
+    # Save pattern mapping including directional patterns
+    pattern_mapping = {i: pattern for i, pattern in enumerate(label_encoder.classes_)}
+    joblib.dump(pattern_mapping, 'pattern_mapping.pkl')
+    
+    print("\nUpdated Pattern Label Mapping (Including Directional):")
+    for i, pattern in pattern_mapping.items():
+        print(f"{i}: {pattern}")
+    
+    # Plot training history
+    plt.figure(figsize=(12, 4))
+    
+    plt.subplot(1, 2, 1)
+    plt.plot(history.history['loss'], label='Training Loss')
+    plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.title('Model Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(history.history['accuracy'], label='Training Accuracy')
+    plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+    plt.title('Model Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Send update notification
+    try:
+        requests.post("http://localhost:5000/update", json={"Updated": "CNN"})
+        print("Update notification sent to trading bot.")
+    except Exception as e:
+        print(f"Could not send update notification: {e}")
+        pass
+
+if __name__ == "__main__":
+    while True:
+        main()
