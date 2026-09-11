@@ -1,0 +1,419 @@
+import numpy as np
+import pandas as pd
+import datetime
+import requests
+import matplotlib.pyplot as plt
+import talib
+import os
+import logging
+import joblib
+from sklearn.preprocessing import RobustScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.activations import swish
+
+# Constants
+LOOKBACK = 60
+TARGET_LOOKAHEAD = 1
+EMA_PERIOD = 2
+ALPHA = 2 / (EMA_PERIOD + 1)
+
+# Global variables
+lstm_model = None
+cnn_model = None
+models_loaded = False
+pattern_label_encoder = None
+pattern_mapping = None
+sarimax_model = None
+sarimax_scaler_x = None
+sarimax_scaler_y = None
+sarimax_metadata = None
+sarimax_mae = None
+
+def fetch_historical_data():
+    end_time = int(pd.Timestamp.now().timestamp()*1000)
+    start_time = int((pd.Timestamp.now()-pd.Timedelta(days=365)).timestamp()*1000)
+    url = f"https://public.coindcx.com/market_data/candles?pair=B-LAB_USDT&interval=1m&startTime={start_time}&endTime={end_time}"
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+    data = response.json()
+
+    # Convert list of dicts to list of lists
+    formatted_data = [
+        [d["time"], d["open"], d["high"], d["low"], d["close"], d["volume"], 0]
+        for d in data
+    ]
+    return formatted_data
+
+def preprocess_data(data):
+    """Process raw API data into structured DataFrame with new features"""
+    columns = ['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI']
+    df = pd.DataFrame(data, columns=columns)
+    
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    df.set_index('timestamp', inplace=True)
+    
+    # Basic transformations
+    df['log_close'] = np.log(df['Close'])
+    df['close_diff'] = df['Close'].diff()
+    
+    # Momentum indicators
+    df['rsi'] = talib.RSI(df['Close'], timeperiod=14)
+    df['mom'] = talib.MOM(df['Close'], timeperiod=10)
+    
+    # EMA indicators
+    df['ema_5'] = talib.EMA(df['Close'], timeperiod=5)
+    df['ema_10'] = talib.EMA(df['Close'], timeperiod=10)
+    df['ema_20'] = talib.EMA(df['Close'], timeperiod=20)
+    df['ema_50'] = talib.EMA(df['Close'], timeperiod=50)
+    
+    # Price to EMA ratios
+    df['close_ema_5_ratio'] = df['Close'] / df['ema_5']
+    df['close_ema_10_ratio'] = df['Close'] / df['ema_10']
+    df['close_ema_20_ratio'] = df['Close'] / df['ema_20']
+    df['close_ema_50_ratio'] = df['Close'] / df['ema_50']
+    
+    # Rate of Change indicators
+    df['roc_5'] = talib.ROC(df['Close'], timeperiod=5)
+    df['roc_10'] = talib.ROC(df['Close'], timeperiod=10)
+    df['roc_15'] = talib.ROC(df['Close'], timeperiod=15)
+    
+    # Volatility indicators (standard deviation of returns)
+    df['returns'] = df['Close'].pct_change()
+    df['volatility_10'] = df['returns'].rolling(10).std()
+    df['volatility_20'] = df['returns'].rolling(20).std()
+    
+    # Target calculation (EMA in future periods)
+    df['Next_Close'] = df['Close'].shift(-TARGET_LOOKAHEAD)
+    df['ema'] = talib.EMA(df['Next_Close'], timeperiod=EMA_PERIOD)
+    
+    # Clean data
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df.dropna(inplace=True)
+    
+    return df
+
+def create_dummy_lstm_model():
+    """Create dummy LSTM model for testing"""
+    global lstm_model
+    lstm_model = Sequential([
+        LSTM(64, return_sequences=True, input_shape=(LOOKBACK, 17)),
+        Dropout(0.3),
+        LSTM(32),
+        Dropout(0.3),
+        Dense(1)
+    ])
+    lstm_model.compile(optimizer='adam', loss='mse')
+    logging.warning("Dummy LSTM model created")
+
+def create_dummy_cnn_model():
+    """Create dummy CNN model for testing"""
+    global cnn_model
+    cnn_model = Sequential([
+        Dense(64, activation='relu', input_shape=(LOOKBACK, 17)),
+        Dropout(0.3),
+        Dense(32, activation='relu'),
+        Dropout(0.3),
+        Dense(10, activation='softmax')
+    ])
+    cnn_model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+    logging.warning("Dummy CNN model created")
+
+def create_dummy_sarimax_model():
+    """Create dummy SARIMAX model for testing"""
+    global sarimax_model, sarimax_scaler_x, sarimax_scaler_y, sarimax_metadata
+    sarimax_model = None
+    sarimax_scaler_x = RobustScaler()
+    sarimax_scaler_y = RobustScaler()
+    sarimax_metadata = {'feature_names': ['log_close', 'close_diff']}
+    logging.warning("Dummy SARIMAX model created")
+
+def create_fallback_encoders():
+    """Create fallback encoders if files can't be loaded"""
+    global pattern_label_encoder, pattern_mapping
+    pattern_label_encoder = None
+    pattern_mapping = None
+    logging.warning("Fallback encoders created")
+
+def load_models(model=None):
+    """Load the specified ML model"""
+    global lstm_model, cnn_model, models_loaded, pattern_label_encoder, pattern_mapping
+    global sarimax_model, sarimax_scaler_x, sarimax_scaler_y, sarimax_metadata, sarimax_mae
+    
+    # Configure logging if not already configured
+    if not logging.getLogger().hasHandlers():
+        logging.basicConfig(level=logging.INFO)
+    
+    try:
+        if model == 'LSTM':
+            if os.path.exists("lstm_model_coindcx_optimized.h5"):
+                lstm_model = load_model("lstm_model_coindcx_optimized.h5", compile=False)
+                logging.info("LSTM model loaded successfully")
+            else:
+                logging.warning("LSTM model file not found - creating dummy model")
+                create_dummy_lstm_model()
+                
+        elif model == 'CNN':
+            if os.path.exists("candlestick_pattern_classifier.h5"):
+                cnn_model = load_model("candlestick_pattern_classifier.h5", compile=False)
+                logging.info("CNN pattern classifier loaded successfully")
+            else:
+                logging.warning("CNN model file not found - creating dummy model")
+                create_dummy_cnn_model()
+            
+            try:
+                pattern_label_encoder = joblib.load('pattern_label_encoder.pkl')
+                pattern_mapping = joblib.load('pattern_mapping.pkl')
+                logging.info("Pattern encoders loaded successfully")
+            except Exception as e:
+                logging.warning(f"Could not load pattern encoders: {e}")
+                create_fallback_encoders()
+                
+        elif model == 'SARIMAX':
+            try:
+                if (os.path.exists('sarimax_model_coindcx_optimized.pkl') and 
+                    os.path.exists('sarimax_scaler_x.pkl') and 
+                    os.path.exists('sarimax_scaler_y.pkl')):
+                    
+                    sarimax_model = joblib.load('sarimax_model_coindcx_optimized.pkl')
+                    sarimax_scaler_x = joblib.load('sarimax_scaler_x.pkl')
+                    sarimax_scaler_y = joblib.load('sarimax_scaler_y.pkl')
+                    logging.info("SARIMAX model and scalers loaded successfully")
+                    
+                    # Create metadata if it doesn't exist
+                    if os.path.exists('sarimax_metadata.pkl'):
+                        sarimax_metadata = joblib.load('sarimax_metadata.pkl')
+                    else:
+                        sarimax_metadata = {
+                            'feature_names': [
+                                'log_close', 'close_diff', 'rsi', 'mom',
+                                'ema_5', 'ema_10', 'ema_20', 'ema_50',
+                                'close_ema_5_ratio', 'close_ema_10_ratio',
+                                'close_ema_20_ratio', 'close_ema_50_ratio',
+                                'roc_5', 'roc_10', 'roc_15',
+                                'volatility_10', 'volatility_20'
+                            ]
+                        }
+                        joblib.dump(sarimax_metadata, 'sarimax_metadata.pkl')
+                    
+                else:
+                    logging.warning("SARIMAX files not found; creating dummy SARIMAX model")
+                    create_dummy_sarimax_model()
+            except Exception as e:
+                logging.error(f"Error loading SARIMAX assets: {e}")
+                create_dummy_sarimax_model()
+        
+        if lstm_model is not None and cnn_model is not None:
+            models_loaded = True
+            
+        logging.info(f"Successfully loaded {model} model")
+        return True
+    
+    except Exception as e:
+        logging.error(f"Error in load_models: {e}")
+        return False
+
+def create_sequences(df):
+    """Create input sequences and targets for LSTM with new features"""
+    features = [
+        'log_close', 'close_diff', 'rsi', 'mom',
+        'ema_5', 'ema_10', 'ema_20', 'ema_50',
+        'close_ema_5_ratio', 'close_ema_10_ratio',
+        'close_ema_20_ratio', 'close_ema_50_ratio',
+        'roc_5', 'roc_10', 'roc_15',
+        'volatility_10', 'volatility_20'
+    ]
+    target = 'ema'
+    
+    scaler_x = RobustScaler()
+    scaler_y = RobustScaler()
+    
+    # Scale features
+    X_scaled = scaler_x.fit_transform(df[features])
+    
+    # Calculate target (difference between future EMA and current EMA)
+    ema_shifted = df[target].shift(-TARGET_LOOKAHEAD)
+    valid_indices = ~ema_shifted.isna()
+    predicted_diff = (ema_shifted[valid_indices] - df[target][valid_indices]) / ALPHA
+    
+    # Align features with target
+    X_scaled = X_scaled[valid_indices.values]
+    df = df[valid_indices]
+    
+    # Scale target
+    y_scaled = scaler_y.fit_transform(predicted_diff.values.reshape(-1, 1))
+    
+    # Create sequences
+    X, y = [], []
+    for i in range(LOOKBACK, len(df) - TARGET_LOOKAHEAD):
+        X.append(X_scaled[i - LOOKBACK:i])
+        y.append(y_scaled[i - LOOKBACK][0])
+    
+    return np.array(X), np.array(y).reshape(-1, 1), df.iloc[LOOKBACK:-TARGET_LOOKAHEAD], scaler_x, scaler_y
+
+def build_model(input_shape):
+    """Construct LSTM model architecture"""
+    model = Sequential([
+        LSTM(128, return_sequences=True, input_shape=input_shape, kernel_regularizer=l2(0.01)),
+        BatchNormalization(),
+        Dropout(0.3),
+        LSTM(64, return_sequences=True, kernel_regularizer=l2(0.01)),
+        BatchNormalization(),
+        Dropout(0.3),
+        LSTM(32, kernel_regularizer=l2(0.01)),
+        BatchNormalization(),
+        Dropout(0.3),
+        Dense(1)
+    ])
+    model.compile(optimizer='adam', loss='huber', metrics=['mae'])
+    return model
+
+def calculate_metrics(actual, predicted, title):
+    """Calculate and print evaluation metrics"""
+    print(f"\n{title} Metrics:")
+    mae = mean_absolute_error(actual, predicted)
+    rmse = np.sqrt(mean_squared_error(actual, predicted))
+    r2 = r2_score(actual, predicted)
+    
+    print("MAE:", mae)
+    print("RMSE:", rmse)
+    print("R2:", r2)
+    
+    # Avoid division by zero or single-element arrays
+    if len(actual) > 1:
+        direction_correct = np.sign(actual[1:] - actual[:-1]) == np.sign(predicted[1:] - predicted[:-1])
+        print("Direction Accuracy:", np.mean(direction_correct))
+    else:
+        print("Direction Accuracy: N/A (insufficient data)")
+    
+    return mae
+
+def plot_results(df, y_true, y_pred, title):
+    """Visualize predictions vs actuals"""
+    plt.figure(figsize=(14, 6))
+    plt.plot(df.index[-len(y_true):], y_true, label='Actual EMA Future')
+    plt.plot(df.index[-len(y_pred):], y_pred, label='Predicted EMA Future', alpha=0.7)
+    plt.title(title)
+    plt.legend()
+    plt.show()
+
+def main():
+    # Data pipeline
+    try:
+        raw_data = fetch_historical_data()
+        df = preprocess_data(raw_data)
+        X, y, df, scaler_x, scaler_y = create_sequences(df)
+    except Exception as e:
+        print(f"Error in data pipeline: {e}")
+        return
+
+    # Train-test split
+    split_index = int(0.8 * len(X))
+    X_train, X_test = X[:split_index], X[split_index:]
+    y_train, y_test = y[:split_index], y[split_index:]
+
+    # Model training
+    model = build_model((X.shape[1], X.shape[2]))
+    
+    callbacks = [
+        EarlyStopping(patience=10, restore_best_weights=True),
+        ReduceLROnPlateau(factor=0.1, patience=5)
+    ]
+    
+    try:
+        history = model.fit(
+            X_train, y_train,
+            epochs=100,
+            batch_size=8,
+            validation_data=(X_test, y_test),
+            callbacks=callbacks,
+            verbose=1
+        )
+    except Exception as e:
+        print(f"Error during model training: {e}")
+        return
+    
+    # Plot training history
+    plt.figure(figsize=(12, 5))
+    plt.plot(history.history['loss'], label='Train Loss')
+    plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.title('Model Training History')
+    plt.legend()
+    plt.show()
+    
+    # Predictions
+    try:
+        y_train_pred = model.predict(X_train)
+        y_test_pred = model.predict(X_test)
+    except Exception as e:
+        print(f"Error during prediction: {e}")
+        return
+    
+    # Inverse scaling
+    y_train_pred_inv = scaler_y.inverse_transform(y_train_pred)
+    y_test_pred_inv = scaler_y.inverse_transform(y_test_pred)
+    
+    # Get base EMA values with safe indexing
+    train_indices = range(len(y_train_pred))
+    test_indices = range(len(y_train_pred), min(len(y_train_pred) + len(y_test_pred), len(df)))
+    
+    # Adjust predictions if we had to truncate test indices
+    if len(test_indices) < len(y_test_pred):
+        y_test_pred_inv = y_test_pred_inv[:len(test_indices)]
+    
+    base_ema_train = df['ema'].iloc[train_indices].values
+    base_ema_test = df['ema'].iloc[test_indices].values
+    
+    # Reconstruct future EMA
+    y_train_recon = base_ema_train + (ALPHA * y_train_pred_inv.flatten())
+    y_test_recon = base_ema_test + (ALPHA * y_test_pred_inv.flatten())
+    
+    # Get true future values with boundary checks
+    y_train_true = []
+    y_test_true = []
+    
+    for i in train_indices:
+        future_idx = i + TARGET_LOOKAHEAD
+        if future_idx < len(df):
+            y_train_true.append(df['ema'].iloc[future_idx])
+    
+    for i in test_indices:
+        future_idx = i + TARGET_LOOKAHEAD
+        if future_idx < len(df):
+            y_test_true.append(df['ema'].iloc[future_idx])
+    
+    # Convert to numpy arrays
+    y_train_true = np.array(y_train_true)
+    y_test_true = np.array(y_test_true)
+    
+    # Trim predictions to match available true values
+    y_train_recon = y_train_recon[:len(y_train_true)]
+    y_test_recon = y_test_recon[:len(y_test_true)]
+    
+    # Only proceed if we have predictions to evaluate
+    if len(y_train_true) > 0 and len(y_train_recon) > 0:
+        calculate_metrics(y_train_true, y_train_recon, "Train")
+    else:
+        print("No training predictions to evaluate")
+    
+    if len(y_test_true) > 0 and len(y_test_recon) > 0:
+        lstm_mae = calculate_metrics(y_test_true, y_test_recon, "Test")
+
+        # Visualization - only if we have test results
+        plot_df = df.iloc[test_indices[0]:test_indices[-1]+1] if len(test_indices) > 0 else df.iloc[-len(y_test_recon):]
+        plot_results(plot_df, y_test_true, y_test_recon, 'Test Set - EMA Future Prediction')
+        model.save('lstm_model_coindcx_optimized.h5')
+        try:
+            requests.post("http://localhost:5000/update", json={"Updated": "LSTM"})
+            requests.post("http://localhost:5000/update", json={"LSTM": lstm_mae})
+        except:
+            pass
+    else:
+        print("No test predictions to evaluate")
+
+if __name__ == "__main__":
+    while True:
+        main()
